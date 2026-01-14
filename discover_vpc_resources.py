@@ -29,11 +29,14 @@ def _infer_tier_from_subnet(subnet):
         if tier_l in {'public', 'private', 'nonroutable'}:
             return tier_l
     name = (_tag_value(tags, 'Name') or '').lower()
-    if 'nonroutable' in name or 'non-routable' in name:
+    # Check for nonroutable variations (nr, nonroutable, non-routable)
+    if 'nonroutable' in name or 'non-routable' in name or '-nr-' in name or name.endswith('-nr'):
         return 'nonroutable'
-    if 'public' in name:
+    # Check for public variations (pub, public)
+    if 'public' in name or '-pub-' in name:
         return 'public'
-    if 'private' in name:
+    # Check for private variations (pvt, private, priv)
+    if 'private' in name or '-pvt-' in name or '-priv-' in name:
         return 'private'
     return None
 
