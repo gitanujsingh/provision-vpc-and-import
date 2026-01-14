@@ -60,6 +60,14 @@ def _parse_tfvars(tfvars_path: str) -> Dict[str, Any]:
                 out.append(m.group(1))
         return out
 
+    def parse_bool(name: str) -> Optional[bool]:
+        pattern = re.compile(rf"^\s*{re.escape(name)}\s*=\s*(true|false)\s*$")
+        for ln in lines:
+            m = pattern.match(ln)
+            if m:
+                return m.group(1) == "true"
+        return None
+
     def parse_rule_numbers(list_name: str) -> List[int]:
         # Very small HCL-ish parser for:
         # nacl_rules = {
@@ -113,6 +121,37 @@ def _parse_tfvars(tfvars_path: str) -> Dict[str, Any]:
                 if m:
                     sg_keys.append(m.group(1))
         return sg_keys
+
+    def parse_interface_vpc_endpoints() -> List[str]:
+        # Parse interface_vpc_endpoints map keys
+        # interface_vpc_endpoints = {
+        #   "ec2" = { ... }
+        #   "ssm" = { ... }
+        # }
+        key_re = re.compile(r'^\s*\"([^\"]+)\"\s*=\s*\{\s*$')
+        in_ep_block = False
+        brace_depth = 0
+        ep_keys = []
+        for ln in lines:
+            if re.match(r'^\s*interface_vpc_endpoints\s*=\s*\{\s*$', ln):
+                in_ep_block = True
+                brace_depth = 1
+                continue
+            if in_ep_block:
+                # Track opening braces
+                if '{' in ln:
+                    brace_depth += ln.count('{')
+                # Track closing braces
+                if '}' in ln:
+                    brace_depth -= ln.count('}')
+                # If we're back to depth 0, we've exited the main block
+                if brace_depth == 0:
+                    break
+                # Extract endpoint key at depth 1
+                m = key_re.match(ln)
+                if m:
+                    ep_keys.append(m.group(1))
+        return ep_keys
 
     def parse_extra_routes(tier: str) -> List[Dict[str, str]]:
         # Parse <tier>_extra_routes list to get full route objects
@@ -184,6 +223,12 @@ def _parse_tfvars(tfvars_path: str) -> Dict[str, Any]:
         "public_extra_routes": parse_extra_routes("public"),
         "private_extra_routes": parse_extra_routes("private"),
         "nonroutable_extra_routes": parse_extra_routes("nonroutable"),
+        # Boolean flags
+        "enable_s3_gateway_endpoint": parse_bool("enable_s3_gateway_endpoint"),
+        "enable_interface_endpoints": parse_bool("enable_interface_endpoints"),
+        "enable_vpc_endpoints_sg": parse_bool("enable_vpc_endpoints_sg"),
+        # VPC endpoints
+        "interface_vpc_endpoints": parse_interface_vpc_endpoints(),
     }
 
 
@@ -578,12 +623,9 @@ def generate(import_dir: str, tfvars_path: str, discovery_json_path: str, out_pa
         svc = (ep.get("service_name") or "")
         if not ep_id or not svc:
             continue
-        if svc.endswith(".s3"):
-            vpce_by_suffix["s3"] = ep_id
-        elif svc.endswith(".ec2"):
-            vpce_by_suffix["ec2"] = ep_id
-        elif svc.endswith(".ssm"):
-            vpce_by_suffix["ssm"] = ep_id
+        # Extract service name from format: com.amazonaws.<region>.<service>
+        service_suffix = svc.split(".")[-1]
+        vpce_by_suffix[service_suffix] = ep_id
 
     # DHCP
     dhcp_id = (data.get("dhcp_options") or {}).get("id") or ""
@@ -854,8 +896,8 @@ def generate(import_dir: str, tfvars_path: str, discovery_json_path: str, out_pa
     _emit_import(lines, tfvars_posix, "module.s3_vpc_endpoint[0].aws_vpc_endpoint.this", vpce_by_suffix.get("s3") or "", "S3 VPC endpoint")
     
     # Interface VPC endpoints (dynamic based on tfvars)
-    interface_endpoints = tfv.get("interface_vpc_endpoints", {})
-    for service in interface_endpoints.keys():
+    interface_endpoints = tfv.get("interface_vpc_endpoints", [])
+    for service in interface_endpoints:
         vpce_id = vpce_by_suffix.get(service, "")
         if vpce_id:
             addr = f'module.interface_vpc_endpoints["{service}"].aws_vpc_endpoint.this'
