@@ -852,8 +852,15 @@ def generate(import_dir: str, tfvars_path: str, discovery_json_path: str, out_pa
 
     # VPC endpoints
     _emit_import(lines, tfvars_posix, "module.s3_vpc_endpoint[0].aws_vpc_endpoint.this", vpce_by_suffix.get("s3") or "", "S3 VPC endpoint")
-    _emit_import(lines, tfvars_posix, "module.ec2_vpc_endpoint[0].aws_vpc_endpoint.this", vpce_by_suffix.get("ec2") or "", "EC2 VPC endpoint")
-    _emit_import(lines, tfvars_posix, "module.ssm_vpc_endpoint[0].aws_vpc_endpoint.this", vpce_by_suffix.get("ssm") or "", "SSM VPC endpoint")
+    
+    # Interface VPC endpoints (dynamic based on tfvars)
+    interface_endpoints = tfv.get("interface_vpc_endpoints", {})
+    for service in interface_endpoints.keys():
+        vpce_id = vpce_by_suffix.get(service, "")
+        if vpce_id:
+            addr = f'module.interface_vpc_endpoints["{service}"].aws_vpc_endpoint.this'
+            _emit_import(lines, tfvars_posix, addr, vpce_id, f"{service.upper()} VPC endpoint")
+
 
     # Extra routes from tfvars
     routes_by_rt_dest = {}
@@ -934,7 +941,7 @@ def generate(import_dir: str, tfvars_path: str, discovery_json_path: str, out_pa
     lines.append(r'NAT_GWS=$(count_re "^module\\.gateways\\.aws_nat_gateway\\.(public|private)\\[\\\".*\\\"\\]$")')
     lines.append(r'EIPS=$(count_re "^module\\.gateways\\.aws_eip\\.nat_eip\\[\\\".*\\\"\\]$")')
     lines.append(r'IGW_COUNT=$(count_re "^module\\.gateways\\.aws_internet_gateway\\.igw\\[0\\]$")')
-    lines.append(r'VPCE=$(count_re "^module\\.(s3|ec2|ssm)_vpc_endpoint\\[0\\]\\.aws_vpc_endpoint\\.this$")')
+    lines.append(r'VPCE=$(count_re "^module\\.(s3_vpc_endpoint\\[0\\]|interface_vpc_endpoints\\[\\\".*\\\"\\])\\.aws_vpc_endpoint\\.this$")')
     lines.append(r'SGS=$(count_re "^module\\.(vpc_endpoints_sg\\[0\\]|extra_security_groups\\[\\\".*\\\"\\])\\.aws_security_group\\.this$")')
     lines.append(r'DHCP_COUNT=$(count_re "^module\\.dhcp_options\\.aws_vpc_dhcp_options\\.this$")')
     lines.append(r'ROUTES=$(count_re "^aws_route\\.(public|private|nonroutable)_(default|extra)\\[.*\\]$")')

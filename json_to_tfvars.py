@@ -618,6 +618,32 @@ def _write_tfvars(discovery_path: str, out_path: str) -> dict:
 		else:
 			f.write("enable_vpc_endpoints_sg          = true\n")
 			f.write("vpc_endpoints_security_group_ids = []\n")
+		
+		# Interface VPC Endpoints discovered from AWS
+		interface_endpoints = {}
+		for ep in data.get('vpc_endpoints', []):
+			if ep.get('type') == 'Interface':
+				svc_name = ep.get('service_name', '')
+				if svc_name:
+					# Extract service suffix (e.g., 'ec2' from 'com.amazonaws.us-east-1.ec2')
+					service = svc_name.split('.')[-1]
+					interface_endpoints[service] = {
+						'private_dns_enabled': ep.get('private_dns_enabled', True),
+						'tags': {}
+					}
+		
+		if interface_endpoints:
+			f.write("\n# Interface VPC Endpoints discovered from AWS\n")
+			f.write("interface_vpc_endpoints = {\n")
+			for service, config in sorted(interface_endpoints.items()):
+				f.write(f"  \"{service}\" = {{\n")
+				f.write(f"    private_dns_enabled = {str(config['private_dns_enabled']).lower()}\n")
+				f.write(f"    tags                = {{}}\n")
+				f.write(f"  }}\n")
+			f.write("}\n")
+		else:
+			f.write("\n# No interface VPC endpoints discovered\n")
+			f.write("interface_vpc_endpoints = {}\n")
 
 		# NACL rules discovered from AWS (import-friendly)
 		f.write("\n# NACL rules\n")

@@ -241,4 +241,13 @@ variable "private_onprem_destination_cidr" {
   type        = string
   default     = "10.0.0.0/8"
 }
+
+variable "interface_vpc_endpoints" {
+  description = "Map of interface VPC endpoints to create. Key = service name (e.g., 'ec2', 'ssm', 'ssmmessages')"
+  type = map(object({
+    private_dns_enabled = optional(bool, true)
+    tags                = optional(map(string), {})
+  }))
+  default = {}
+}
 # end#

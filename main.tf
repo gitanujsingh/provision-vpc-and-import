@@ -432,49 +432,33 @@ module "extra_security_groups" {
   tags     = try(each.value.tags, {})
 }
 
-# EC2 Interface Endpoint (all subnets except public)
+# Interface VPC Endpoints (dynamic based on var.interface_vpc_endpoints)
+# Supports any AWS service: ec2, ssm, ssmmessages, ec2messages, etc.
 
-module "ec2_vpc_endpoint" {
-  source = "./modules/vpc-endpoint"
-  count = (var.enable_interface_endpoints && (
+module "interface_vpc_endpoints" {
+  source   = "./modules/vpc-endpoint"
+  for_each = (var.enable_interface_endpoints && (
     (var.enable_private_subnets && length(var.private_subnet_cidrs) > 0) ||
     (var.enable_nonroutable_subnets && length(var.nonroutable_subnet_cidrs) > 0)
     ) && (
     var.enable_vpc_endpoints_sg || length(var.vpc_endpoints_security_group_ids) > 0
-  )) ? 1 : 0
+  )) ? var.interface_vpc_endpoints : {}
+
   vpc_id              = module.vpc.id
-  service_name        = "com.amazonaws.${var.region}.ec2"
+  service_name        = "com.amazonaws.${var.region}.${each.key}"
   vpc_endpoint_type   = "Interface"
   subnet_ids          = local.interface_endpoint_subnet_ids
   security_group_ids  = local.interface_endpoint_sg_ids
-  private_dns_enabled = true
-  tags = {
-    Name        = "${var.vpc_name}-ec2-endpoint"
-    Environment = var.vpc_name
-  }
+  private_dns_enabled = try(each.value.private_dns_enabled, true)
+  tags = merge(
+    {
+      Name        = "${var.vpc_name}-${each.key}-endpoint"
+      Environment = var.vpc_name
+    },
+    try(each.value.tags, {})
+  )
 }
 
-# SSM Interface Endpoint (all subnets except public)
-
-module "ssm_vpc_endpoint" {
-  source = "./modules/vpc-endpoint"
-  count = (var.enable_interface_endpoints && (
-    (var.enable_private_subnets && length(var.private_subnet_cidrs) > 0) ||
-    (var.enable_nonroutable_subnets && length(var.nonroutable_subnet_cidrs) > 0)
-    ) && (
-    var.enable_vpc_endpoints_sg || length(var.vpc_endpoints_security_group_ids) > 0
-  )) ? 1 : 0
-  vpc_id              = module.vpc.id
-  service_name        = "com.amazonaws.${var.region}.ssm"
-  vpc_endpoint_type   = "Interface"
-  subnet_ids          = local.interface_endpoint_subnet_ids
-  security_group_ids  = local.interface_endpoint_sg_ids
-  private_dns_enabled = true
-  tags = {
-    Name        = "${var.vpc_name}-ssm-endpoint"
-    Environment = var.vpc_name
-  }
-}
 
 
 
