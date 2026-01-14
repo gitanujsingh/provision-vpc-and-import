@@ -102,25 +102,48 @@ def _parse_tfvars(tfvars_path: str) -> Dict[str, Any]:
             uniq.append(n)
         return uniq
 
-    def parse_security_groups() -> List[str]:
-        # Parse security_groups map keys
-        # security_groups = {
-        #   "key1" = { ... }
+    def parse_security_groups() -> Dict[str, Dict[str, str]]:
+        # Parse extra_security_groups map
+        # extra_security_groups = {
+        #   "key1" = {
+        #     name = "..."
+        #     description = "..."
+        #   }
         # }
-        sg_re = re.compile(r'^\s*\"([^\"]+)\"\s*=\s*\{\s*$')
+        key_re = re.compile(r'^\s*\"([^\"]+)\"\s*=\s*\{\s*$')
+        name_re = re.compile(r'^\s*name\s*=\s*\"([^\"]+)\"\s*$')
         in_sg_block = False
-        sg_keys = []
+        brace_depth = 0
+        sg_map = {}
+        current_key = None
+        
         for ln in lines:
-            if re.match(r'^\s*security_groups\s*=\s*\{\s*$', ln):
+            if re.match(r'^\s*extra_security_groups\s*=\s*\{\s*$', ln):
                 in_sg_block = True
+                brace_depth = 1
                 continue
             if in_sg_block:
-                if re.match(r'^\s*\}\s*$', ln):
+                # Track braces
+                if '{' in ln:
+                    brace_depth += ln.count('{')
+                if '}' in ln:
+                    brace_depth -= ln.count('}')
+                if brace_depth == 0:
                     break
-                m = sg_re.match(ln)
+                    
+                # Extract SG key at depth 1
+                m = key_re.match(ln)
                 if m:
-                    sg_keys.append(m.group(1))
-        return sg_keys
+                    current_key = m.group(1)
+                    sg_map[current_key] = {"name": current_key}  # Default to key name
+                    
+                # Extract name field
+                if current_key:
+                    m = name_re.match(ln)
+                    if m:
+                        sg_map[current_key]["name"] = m.group(1)
+        
+        return sg_map
 
     def parse_interface_vpc_endpoints() -> List[str]:
         # Parse interface_vpc_endpoints map keys
@@ -219,7 +242,7 @@ def _parse_tfvars(tfvars_path: str) -> Dict[str, Any]:
         "nacl_private_ingress_rule_numbers": parse_rule_numbers("private_ingress"),
         "nacl_private_egress_rule_numbers": parse_rule_numbers("private_egress"),
         # Extra resources
-        "security_group_keys": parse_security_groups(),
+        "extra_security_groups": parse_security_groups(),
         "public_extra_routes": parse_extra_routes("public"),
         "private_extra_routes": parse_extra_routes("private"),
         "nonroutable_extra_routes": parse_extra_routes("nonroutable"),

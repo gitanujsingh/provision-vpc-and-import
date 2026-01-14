@@ -106,21 +106,19 @@ def _convert_sg_rule(rule: dict, rule_type: str) -> dict:
 
 
 def _extract_security_groups(discovery: dict, vpc_endpoint_sg_ids: list = None) -> dict:
-	"""Extract security groups from discovery JSON, excluding default VPC SG and VPC endpoint SGs."""
+	"""Extract all non-default security groups from discovery JSON for import."""
 	sgs = discovery.get('security_groups', [])
 	sg_map = {}
 	vpc_endpoint_sg_ids = vpc_endpoint_sg_ids or []
 	
 	for sg in sgs:
 		sg_name = sg.get('group_name', '')
-		# Skip default VPC security group
+		# Skip default VPC security group only (AWS managed)
 		if sg_name == 'default':
 			continue
 		
-		# Skip VPC endpoint security groups (managed by vpc_endpoints_sg module)
-		sg_id = sg.get('id', '')
-		if sg_id in vpc_endpoint_sg_ids:
-			continue
+		# Include ALL other security groups, even those used by VPC endpoints
+		# They will be imported and managed as extra_security_groups
 		
 		sg_id = sg.get('id', '')
 		if not sg_id:
@@ -481,19 +479,14 @@ def _validate_tfvars_coverage(data: dict, vpc_endpoint_sg_ids: set) -> dict:
 	validation['total_resources'] += len(sgs)
 	for sg in sgs:
 		sg_id = sg.get('id', '')
-		if sg_id in vpc_endpoint_sg_ids:
-			validation['skipped_resources'].append({
-				'type': 'security_group',
-				'id': sg_id,
-				'reason': 'VPC endpoint SG (managed by vpc_endpoints_sg module)'
-			})
-		elif sg.get('group_name') == 'default':
+		if sg.get('group_name') == 'default':
 			validation['skipped_resources'].append({
 				'type': 'security_group',
 				'id': sg_id,
 				'reason': 'Default VPC security group (AWS managed)'
 			})
 		else:
+			# Include ALL non-default security groups (even VPC endpoint SGs)
 			validation['included_resources'] += 1
 	
 	# NAT Gateways
@@ -665,8 +658,8 @@ def _write_tfvars(discovery_path: str, out_path: str) -> dict:
 			f.write("  ]\n")
 		f.write("}\n")
 
-		# Security groups discovered from AWS (excluding VPC endpoint SGs)
-		security_groups = _extract_security_groups(data, vpc_endpoint_sg_ids)
+		# Security groups discovered from AWS (import ALL non-default SGs)
+		security_groups = _extract_security_groups(data, vpc_endpoint_sg_ids=[])
 		if security_groups:
 			f.write("\n# Security groups discovered from VPC\n")
 			f.write("extra_security_groups = {\n")
