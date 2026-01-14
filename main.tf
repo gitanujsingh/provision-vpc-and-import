@@ -78,7 +78,7 @@ module "public_subnets" {
   availability_zone       = element(var.azs, index(local.public_subnet_cidrs, each.value))
   map_public_ip_on_launch = true
   region                  = var.region
-  name                    = "ntw-dev-public-subnet-${element(var.azs, index(local.public_subnet_cidrs, each.value))}"
+  name                    = "${var.vpc_name}-pub-subnet-${element(var.azs, index(local.public_subnet_cidrs, each.value))}"
   application             = "ntw"
   created_by              = "Cloud Network Team"
   creation_date           = timestamp()
@@ -97,7 +97,7 @@ module "private_subnets" {
   cidr_block        = each.value
   availability_zone = element(var.azs, index(local.private_subnet_cidrs, each.value))
   region            = var.region
-  name              = "ntw-dev-private-subnet-${element(var.azs, index(local.private_subnet_cidrs, each.value))}"
+  name              = "${var.vpc_name}-pvt-subnet-${element(var.azs, index(local.private_subnet_cidrs, each.value))}"
   application       = "ntw"
   created_by        = "Cloud Network Team"
   creation_date     = timestamp()
@@ -116,7 +116,7 @@ module "nonroutable_subnets" {
   cidr_block        = each.value
   availability_zone = element(var.azs, index(local.nonroutable_subnet_cidrs, each.value))
   region            = var.region
-  name              = "ntw-dev-nonroutable-subnet-${element(var.azs, index(local.nonroutable_subnet_cidrs, each.value))}"
+  name              = "${var.vpc_name}-nr-subnet-${element(var.azs, index(local.nonroutable_subnet_cidrs, each.value))}"
   application       = "ntw"
   created_by        = "Cloud Network Team"
   creation_date     = timestamp()
