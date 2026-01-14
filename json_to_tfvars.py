@@ -106,20 +106,13 @@ def _convert_sg_rule(rule: dict, rule_type: str) -> dict:
 
 
 def _extract_security_groups(discovery: dict, vpc_endpoint_sg_ids: list = None) -> dict:
-	"""Extract all non-default security groups from discovery JSON for import."""
+	"""Extract all security groups including default from discovery JSON for import."""
 	sgs = discovery.get('security_groups', [])
 	sg_map = {}
 	vpc_endpoint_sg_ids = vpc_endpoint_sg_ids or []
 	
 	for sg in sgs:
 		sg_name = sg.get('group_name', '')
-		# Skip default VPC security group only (AWS managed)
-		if sg_name == 'default':
-			continue
-		
-		# Include ALL other security groups, even those used by VPC endpoints
-		# They will be imported and managed as extra_security_groups
-		
 		sg_id = sg.get('id', '')
 		if not sg_id:
 			continue
@@ -474,20 +467,10 @@ def _validate_tfvars_coverage(data: dict, vpc_endpoint_sg_ids: set) -> dict:
 		else:
 			validation['included_resources'] += 1
 	
-	# Security Groups
+	# Security Groups (including default)
 	sgs = data.get('security_groups', [])
 	validation['total_resources'] += len(sgs)
-	for sg in sgs:
-		sg_id = sg.get('id', '')
-		if sg.get('group_name') == 'default':
-			validation['skipped_resources'].append({
-				'type': 'security_group',
-				'id': sg_id,
-				'reason': 'Default VPC security group (AWS managed)'
-			})
-		else:
-			# Include ALL non-default security groups (even VPC endpoint SGs)
-			validation['included_resources'] += 1
+	validation['included_resources'] += len(sgs)
 	
 	# NAT Gateways
 	nats = data.get('nat_gateways', [])

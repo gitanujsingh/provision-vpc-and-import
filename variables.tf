@@ -177,18 +177,20 @@ variable "extra_security_groups" {
     name        = string
     description = string
     ingress_rules = optional(list(object({
-      from_port   = number
-      to_port     = number
-      protocol    = string
-      cidr_blocks = list(string)
-      description = optional(string)
+      from_port                = number
+      to_port                  = number
+      protocol                 = string
+      cidr_blocks              = optional(list(string), [])
+      source_security_group_id = optional(string)
+      description              = optional(string)
     })), [])
     egress_rules = optional(list(object({
-      from_port   = number
-      to_port     = number
-      protocol    = string
-      cidr_blocks = list(string)
-      description = optional(string)
+      from_port                = number
+      to_port                  = number
+      protocol                 = string
+      cidr_blocks              = optional(list(string), [])
+      source_security_group_id = optional(string)
+      description              = optional(string)
     })), [])
     tags = optional(map(string), {})
   }))

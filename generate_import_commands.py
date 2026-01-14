@@ -313,18 +313,15 @@ def _validate_import_coverage(discovery: Dict[str, Any], tfv: Dict[str, Any]) ->
         else:
             validation['will_import'] += 1
     
-    # Security Groups
+    # Security Groups (including default)
     sgs = discovery.get('security_groups', [])
-    sg_keys_in_tfvars = set(tfv.get('security_group_keys', []))
+    sg_keys_in_tfvars = set(tfv.get('extra_security_groups', {}).keys())
     for sg in sgs:
         validation['total_importable'] += 1
-        if sg.get('group_name') == 'default':
-            validation['skipped'].append({
-                'type': 'security_group',
-                'id': sg.get('id'),
-                'reason': 'Default VPC security group (AWS managed)'
-            })
-        elif not sg_keys_in_tfvars:
+        sg_name = sg.get('group_name', '')
+        # Sanitize sg_name to match the key generated in tfvars
+        sg_key = re.sub(r'[^a-zA-Z0-9_-]', '_', sg_name)
+        if sg_key not in sg_keys_in_tfvars:
             validation['skipped'].append({
                 'type': 'security_group',
                 'id': sg.get('id'),
@@ -703,6 +700,7 @@ def generate(import_dir: str, tfvars_path: str, discovery_json_path: str, out_pa
     
     # Count resources from discovery JSON
     vpc_count = 1 if vpc_id else 0
+    primary_cidr = data.get('vpc', {}).get('cidr_block', 'N/A')
     additional_cidrs_count = len(additional_cidrs)
     public_subnets_count = len(public_cidrs)
     private_subnets_count = len(private_cidrs)
@@ -712,38 +710,42 @@ def generate(import_dir: str, tfvars_path: str, discovery_json_path: str, out_pa
     # Route tables
     rt_count = len(data.get('route_tables', []))
     
-    # Routes
+    # Routes (exclude local routes which are AWS-managed)
     routes = data.get('routes', [])
-    default_routes = sum(1 for r in routes if r.get('DestinationCidrBlock') == '0.0.0.0/0')
-    extra_routes_count = len(routes) - default_routes - (rt_count * 3)  # Subtract local routes
-    total_routes = len(routes)
+    local_routes = [r for r in routes if r.get('GatewayId', '').startswith('local')]
+    importable_routes = [r for r in routes if not r.get('GatewayId', '').startswith('local')]
+    default_routes = sum(1 for r in importable_routes if r.get('DestinationCidrBlock') == '0.0.0.0/0')
+    extra_routes = [r for r in importable_routes if r.get('DestinationCidrBlock') != '0.0.0.0/0']
+    total_importable_routes = len(importable_routes)
     
     # NAT gateways
     nats = data.get('nat_gateways', [])
-    public_nats = sum(1 for n in nats if 'PublicIp' in n)
-    private_nats = len(nats) - public_nats
+    public_nats = sum(1 for n in nats if n.get('connectivity_type') == 'public')
+    private_nats = sum(1 for n in nats if n.get('connectivity_type') == 'private')
     
     # VPC endpoints
     endpoints = data.get('vpc_endpoints', [])
     gateway_endpoints = sum(1 for ep in endpoints if ep.get('type') == 'Gateway')
     interface_endpoints = sum(1 for ep in endpoints if ep.get('type') == 'Interface')
     
-    # Security groups (excluding default)
+    # Security groups (including default)
     sgs = data.get('security_groups', [])
-    non_default_sgs = sum(1 for sg in sgs if not sg.get('is_default'))
+    default_sgs = sum(1 for sg in sgs if sg.get('is_default'))
+    custom_sgs = sum(1 for sg in sgs if not sg.get('is_default'))
     
     lines.append(f'echo "VPC: {vpc_count}"')
+    lines.append(f'echo "Primary CIDR Block: {primary_cidr}"')
     lines.append(f'echo "Subnets: {total_subnets} (Public: {public_subnets_count}, Private: {private_subnets_count}, Nonroutable: {nonroutable_subnets_count})"')
     lines.append(f'echo "Additional CIDR Blocks: {additional_cidrs_count}"')
     lines.append(f'echo "Network ACLs: 2"')  # Always 2 (public and private+nonroutable)
     lines.append(f'echo "Route Tables: {rt_count}"')
-    lines.append(f'echo "Routes: {total_routes} (Default: {default_routes}, Extra: {extra_routes_count})"')
+    lines.append(f'echo "Routes: {total_importable_routes} (Default: {default_routes}, Extra: {len(extra_routes)})"')
     lines.append(f'echo "NAT Gateways: {len(nats)} (Public: {public_nats}, Private: {private_nats})"')
-    eips_count = len(data.get('elastic_ips', []))
+    eips_count = len(data.get('eips', []))
     lines.append(f'echo "Elastic IPs: {eips_count}"')
     lines.append(f'echo "Internet Gateway: {1 if data.get("internet_gateway") else 0}"')
     lines.append(f'echo "VPC Endpoints: {len(endpoints)} (Gateway: {gateway_endpoints}, Interface: {interface_endpoints})"')
-    lines.append(f'echo "Security Groups: {len(sgs)}"')
+    lines.append(f'echo "Security Groups: {len(sgs)} (Default: {default_sgs}, Custom: {custom_sgs})"')
     lines.append(f'echo "DHCP Options: {1 if data.get("dhcp_options") else 0}"')
     lines.append('echo "============================================================"')
     lines.append('echo ""')
@@ -1067,9 +1069,17 @@ def generate(import_dir: str, tfvars_path: str, discovery_json_path: str, out_pa
     lines.append(r'NONROUTABLE_SUBNETS=$(count_re "^module\\.nonroutable_subnets\\[\\\".*\\\"\\]\\.aws_subnet\\.child_module$")')
     lines.append('SUBNETS=$((PUBLIC_SUBNETS + PRIVATE_SUBNETS + NONROUTABLE_SUBNETS))')
     lines.append('')
+    lines.append(r'PRIMARY_CIDRS=$(count_re "^module\\.vpc\\.aws_vpc\\.child_module$")')
     lines.append(r'ADDITIONAL_CIDRS=$(count_re "^module\\.vpc\\.aws_vpc_ipv4_cidr_block_association\\.additional\\[\\\".*\\\"\\]$")')
+    lines.append('TOTAL_CIDRS=$((PRIMARY_CIDRS + ADDITIONAL_CIDRS))')
     lines.append(r'NACLS=$(count_re "^module\\.nacls\\.aws_network_acl\\..+$")')
     lines.append(r'ROUTE_TABLES=$(count_re "^module\\.(public_route_table\\[0\\]|private_route_tables\\[\\\".*\\\"\\]|nonroutable_route_tables\\[\\\".*\\\"\\])\\.aws_route_table\\.this$")')
+    lines.append('')
+    # Detailed route table association counting
+    lines.append(r'PUBLIC_RT_ASSOCS=$(count_re "^module\\.public_route_table\\[0\\]\\.aws_route_table_association\\.this\\[\\\".*\\\"\\]$")')
+    lines.append(r'PRIVATE_RT_ASSOCS=$(count_re "^module\\.private_route_tables\\[\\\".*\\\"\\]\\.aws_route_table_association\\.this\\[\\\".*\\\"\\]$")')
+    lines.append(r'NONROUTABLE_RT_ASSOCS=$(count_re "^module\\.nonroutable_route_tables\\[\\\".*\\\"\\]\\.aws_route_table_association\\.this\\[\\\".*\\\"\\]$")')
+    lines.append('RT_ASSOCS=$((PUBLIC_RT_ASSOCS + PRIVATE_RT_ASSOCS + NONROUTABLE_RT_ASSOCS))')
     lines.append('')
     # Detailed route counting
     lines.append(r'DEFAULT_ROUTES=$(count_re "^aws_route\\.(public|private|nonroutable)_default\\[.*\\]$")')
@@ -1089,19 +1099,53 @@ def generate(import_dir: str, tfvars_path: str, discovery_json_path: str, out_pa
     lines.append(r'INTERFACE_ENDPOINTS=$(count_re "^module\\.interface_vpc_endpoints\\[\\\".*\\\"\\]\\.aws_vpc_endpoint\\.this$")')
     lines.append('VPCE=$((GATEWAY_ENDPOINTS + INTERFACE_ENDPOINTS))')
     lines.append('')
-    lines.append(r'SGS=$(count_re "^module\\.(vpc_endpoints_sg\\[0\\]|extra_security_groups\\[\\\".*\\\"\\])\\.aws_security_group\\.this$")')
+    # Detailed security group counting
+    lines.append(r'DEFAULT_SGS=$(terraform state list 2>/dev/null | grep "^module\\.extra_security_groups\\[\\\"default\\\"\\]\\.aws_security_group\\.this$" | wc -l || echo 0)')
+    lines.append(r'CUSTOM_SGS=$(terraform state list 2>/dev/null | grep "^module\\.extra_security_groups\\[" | grep -v "\\[\\\"default\\\"\\]" | wc -l || echo 0)')
+    lines.append('SGS=$((DEFAULT_SGS + CUSTOM_SGS))')
+    lines.append('')
     lines.append(r'DHCP_COUNT=$(count_re "^module\\.dhcp_options\\.aws_vpc_dhcp_options\\.this$")')
     lines.append('')
+    lines.append('# Extract primary CIDR')
+    lines.append('PRIMARY_CIDR=$(terraform state show -no-color module.vpc.aws_vpc.child_module 2>/dev/null | awk \'/^[[:space:]]*cidr_block[[:space:]]*=/{cidr=$NF; gsub(/"/,"",cidr); print cidr; exit}\' || echo "unknown")')
+    lines.append('')
     lines.append('echo "Subnets: $SUBNETS (Public: $PUBLIC_SUBNETS, Private: $PRIVATE_SUBNETS, Nonroutable: $NONROUTABLE_SUBNETS)"')
-    lines.append('echo "Additional CIDR Blocks: $ADDITIONAL_CIDRS"')
+    lines.append('echo "CIDR Blocks: $TOTAL_CIDRS (Primary: $PRIMARY_CIDRS, Additional: $ADDITIONAL_CIDRS)"')
+    lines.append('echo "  ├─ Primary: $PRIMARY_CIDR"')
+    lines.append('if [[ "$ADDITIONAL_CIDRS" -gt 0 ]]; then')
+    lines.append('  echo "  └─ Additional:"')
+    lines.append('  terraform state list 2>/dev/null | grep "^module\\\\.vpc\\\\.aws_vpc_ipv4_cidr_block_association\\\\.additional\\\\[" | while IFS= read -r cidr_resource; do')
+    lines.append('    cidr_block=$(terraform state show -no-color "$cidr_resource" 2>/dev/null | awk \'/^[[:space:]]*cidr_block[[:space:]]*=/{cidr=$NF; gsub(/"/,"",cidr); print cidr; exit}\' || echo "unknown")')
+    lines.append('    echo "      ├─ $cidr_block"')
+    lines.append('  done')
+    lines.append('fi')
     lines.append('echo "NACLs: $NACLS"')
     lines.append('echo "Route Tables: $ROUTE_TABLES"')
+    lines.append('echo "Route Table Associations: $RT_ASSOCS"')
+    lines.append('echo "  ├─ Public: $PUBLIC_RT_ASSOCS"')
+    lines.append('echo "  ├─ Private: $PRIVATE_RT_ASSOCS"')
+    lines.append('echo "  └─ Nonroutable: $NONROUTABLE_RT_ASSOCS"')
     lines.append('echo "Routes: $ROUTES (Default: $DEFAULT_ROUTES, Extra: $EXTRA_ROUTES)"')
     lines.append('echo "NAT Gateways: $NAT_GWS (Public: $PUBLIC_NATS, Private: $PRIVATE_NATS)"')
     lines.append('echo "EIPs: $EIPS"')
-    lines.append('if [[ "$IGW_COUNT" -gt 0 ]]; then echo "IGW: yes"; else echo "IGW: no"; fi')
+    lines.append('echo "IGW: $IGW_COUNT"')
     lines.append('echo "VPC Endpoints: $VPCE (Gateway: $GATEWAY_ENDPOINTS, Interface: $INTERFACE_ENDPOINTS)"')
-    lines.append('echo "Security Groups: $SGS"')
+    lines.append('echo "Security Groups: $SGS (Default: $DEFAULT_SGS, Custom: $CUSTOM_SGS)"')
+    lines.append('')
+    lines.append('# List security group IDs and names')
+    lines.append('echo "  ├─ Default: $DEFAULT_SGS"')
+    lines.append('if [[ "$DEFAULT_SGS" -gt 0 ]]; then')
+    lines.append('  terraform state show -no-color module.extra_security_groups[\\\"default\\\"].aws_security_group.this 2>/dev/null | awk \'/^[[:space:]]*id[[:space:]]*=/{id=$NF; gsub(/"/,"",id)} /^[[:space:]]*name[[:space:]]*=/{name=$NF; gsub(/"/,"",name); print "  │   └─ " id " (" name ")"}\' || true')
+    lines.append('fi')
+    lines.append('echo "  └─ Custom: $CUSTOM_SGS"')
+    lines.append('if [[ "$CUSTOM_SGS" -gt 0 ]]; then')
+    lines.append('  terraform state list 2>/dev/null | grep "^module\\\\.extra_security_groups\\\\[" | grep -v \'\\["default"\\]\' | while IFS= read -r sg_resource; do')
+    lines.append('    sg_id=$(terraform state show -no-color "$sg_resource" 2>/dev/null | awk \'/^[[:space:]]*id[[:space:]]*=/{id=$NF; gsub(/"/,"",id); print id; exit}\' || echo "unknown")')
+    lines.append('    sg_name=$(terraform state show -no-color "$sg_resource" 2>/dev/null | awk \'/^[[:space:]]*name[[:space:]]*=/{name=$NF; gsub(/"/,"",name); print name; exit}\' || echo "unknown")')
+    lines.append('    echo "      ├─ $sg_id ($sg_name)"')
+    lines.append('  done | sed \'$ s/├/└/\'')  # Replace last ├ with └
+    lines.append('fi')
+    lines.append('')
     lines.append('if [[ "$DHCP_COUNT" -gt 0 ]]; then echo "DHCP Options: yes"; else echo "DHCP Options: no"; fi')
     lines.append('echo "============================================================"')
     lines.append('TOTAL_IMPORTED=$((IMPORTED+SKIPPED))')
