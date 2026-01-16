@@ -29,6 +29,19 @@ def _load_latest_discovery_json(import_dir: str) -> str:
 
 
 def _parse_tfvars(tfvars_path: str) -> Dict[str, Any]:
+        def parse_dhcp_option(name: str, default=None):
+            # Handles both string and list values
+            pattern_str = re.compile(rf"^\s*{re.escape(name)}\s*=\s*\"([^\"]*)\"\s*$")
+            pattern_list = re.compile(rf"^\s*{re.escape(name)}\s*=\s*\[(.*)\]\s*$")
+            for ln in lines:
+                m = pattern_str.match(ln)
+                if m:
+                    return m.group(1)
+                m = pattern_list.match(ln)
+                if m:
+                    # Parse comma-separated quoted values
+                    return [s.strip().strip('"') for s in m.group(1).split(',') if s.strip()]
+            return default
     if not os.path.isfile(tfvars_path):
         raise FileNotFoundError(tfvars_path)
 
@@ -226,7 +239,7 @@ def _parse_tfvars(tfvars_path: str) -> Dict[str, Any]:
         
         return routes
 
-    return {
+    result = {
         "environment": parse_string("environment"),
         "region": parse_string("region"),
         "vpc_name": parse_string("vpc_name"),
@@ -253,6 +266,13 @@ def _parse_tfvars(tfvars_path: str) -> Dict[str, Any]:
         # VPC endpoints
         "interface_vpc_endpoints": parse_interface_vpc_endpoints(),
     }
+    # DHCP Options
+    result["domain_name"] = parse_dhcp_option("domain_name", "ec2.internal")
+    result["domain_name_servers"] = parse_dhcp_option("domain_name_servers", ["AmazonProvidedDNS"])
+    result["ntp_servers"] = parse_dhcp_option("ntp_servers", ["0.0.0.0"])
+    result["netbios_name_servers"] = parse_dhcp_option("netbios_name_servers", ["192.168.1.1"])
+    result["netbios_node_type"] = parse_dhcp_option("netbios_node_type", 2)
+    return result
 
 
 def _normalize_protocol(proto: Any) -> str:

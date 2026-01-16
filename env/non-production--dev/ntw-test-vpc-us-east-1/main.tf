@@ -27,16 +27,7 @@ locals {
     lookup({ for k, s in module.private_subnets : s.availability_zone => s.id }, az, null) != null ? lookup({ for k, s in module.private_subnets : s.availability_zone => s.id }, az, null) : lookup({ for k, s in module.nonroutable_subnets : s.availability_zone => s.id }, az, null)
   ]))
 
-  # Resolve interface endpoint security groups
-  # If vpc_endpoints_security_group_ids contains "DYNAMIC", use the endpoint-sg from extra_security_groups
-  # Otherwise use the provided IDs, or create a new SG if enable_vpc_endpoints_sg is true
-  interface_endpoint_sg_ids = (
-    length(var.vpc_endpoints_security_group_ids) > 0 && contains(var.vpc_endpoints_security_group_ids, "DYNAMIC") 
-    ? [for sg_name, sg in module.extra_security_groups : sg.security_group_id if sg_name == "endpoint-sg"] 
-    : length(var.vpc_endpoints_security_group_ids) > 0 
-    ? var.vpc_endpoints_security_group_ids 
-    : (var.enable_vpc_endpoints_sg ? [module.vpc_endpoints_sg[0].security_group_id] : [])
-  )
+  interface_endpoint_sg_ids = length(var.vpc_endpoints_security_group_ids) > 0 ? var.vpc_endpoints_security_group_ids : (var.enable_vpc_endpoints_sg ? [module.vpc_endpoints_sg[0].security_group_id] : [])
 }
 
 # NACLs for public, private, and nonroutable subnets
@@ -61,7 +52,7 @@ module "nacls" {
 }
 # VPC from child module
 module "vpc" {
-  source = "./modules/vpc"
+  source = "../../../modules/vpc"
 
   region               = var.region
   cidr_block           = var.vpc_cidr
@@ -138,7 +129,7 @@ module "nonroutable_subnets" {
 
 # Public route table (single) — associates all public subnets with one RT.
 module "public_route_table" {
-  source = "./modules/routing-tables"
+  source = "../../../modules/routing-tables"
   count  = local.enable_public_route_table ? 1 : 0
   vpc_id = module.vpc.id
   # default route for internet-bound traffic
@@ -200,7 +191,7 @@ module "nonroutable_route_tables" {
 
 # Gateways: create IGW + NATs
 module "gateways" {
-  source = "./modules/gateways"
+  source = "../../../modules/gateways"
 
   vpc_id     = module.vpc.id
   create_igw = local.enable_gateways && var.enable_internet_gateway
@@ -341,18 +332,11 @@ resource "aws_route" "nonroutable_extra" {
   for_each = {
     for item in flatten([
       for rt_key, rt in module.nonroutable_route_tables : [
-        for r_key, r in local.nonroutable_extra_routes : [
-          {
-            # Use stable key format: just route table CIDR + destination CIDR + target type
-            # This key doesn't change between applies, whether using "local" or actual IDs
-            key            = "${rt_key}-${r.destination_cidr_block}-${r.target_type}"
-            route_table_id = rt.route_table_id
-            route          = r
-            # Resolve "local" to the NAT gateway for this route table's subnet CIDR
-            nat_id         = r.target_id == "local" ? lookup(module.gateways.private_nat_ids, rt_key, null) : r.target_id
-            subnet_cidr    = rt_key
-          }
-        ]
+        for r_key, r in local.nonroutable_extra_routes : {
+          key            = "${rt_key}-${r_key}"
+          route_table_id = rt.route_table_id
+          route          = r
+        }
       ]
     ]) : item.key => item
   }
@@ -360,7 +344,7 @@ resource "aws_route" "nonroutable_extra" {
   destination_cidr_block = each.value.route.destination_cidr_block
 
   gateway_id                = each.value.route.target_type == "gateway_id" ? (each.value.route.target_id == "igw" ? module.gateways.igw_id : each.value.route.target_id) : null
-  nat_gateway_id            = each.value.route.target_type == "nat_gateway_id" ? each.value.nat_id : null
+  nat_gateway_id            = each.value.route.target_type == "nat_gateway_id" ? each.value.route.target_id : null
   transit_gateway_id        = each.value.route.target_type == "transit_gateway_id" ? each.value.route.target_id : null
   vpc_peering_connection_id = each.value.route.target_type == "vpc_peering_connection_id" ? each.value.route.target_id : null
   vpc_endpoint_id           = each.value.route.target_type == "vpc_endpoint_id" ? each.value.route.target_id : null
@@ -371,11 +355,11 @@ resource "aws_route" "nonroutable_extra" {
 module "dhcp_options" {
   source               = "./modules/dhcp-options"
   vpc_id               = module.vpc.id
-  domain_name          = var.domain_name
-  domain_name_servers  = var.domain_name_servers
-  ntp_servers          = var.ntp_servers
-  netbios_name_servers = var.netbios_name_servers
-  netbios_node_type    = var.netbios_node_type
+  domain_name          = "ec2.internal"
+  domain_name_servers  = ["AmazonProvidedDNS"]
+  ntp_servers          = []
+  netbios_name_servers = []
+  netbios_node_type    = null
   tags = {
     Name        = "${var.vpc_name}-dhcp-options"
     Environment = var.vpc_name
@@ -385,7 +369,7 @@ module "dhcp_options" {
 # S3 Gateway Endpoint (private and nonroutable subnets only)
 
 module "s3_vpc_endpoint" {
-  source = "./modules/vpc-endpoint"
+  source = "../../../modules/vpc-endpoint"
   count = (var.enable_s3_gateway_endpoint && (
     (var.enable_private_route_tables && var.enable_private_subnets && length(var.private_subnet_cidrs) > 0) ||
     (var.enable_nonroutable_route_tables && var.enable_nonroutable_subnets && length(var.nonroutable_subnet_cidrs) > 0)

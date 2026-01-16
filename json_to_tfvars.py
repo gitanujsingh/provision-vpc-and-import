@@ -263,6 +263,13 @@ def _extract_vpc_endpoint_sgs(discovery: dict) -> list:
 
 
 def _extract_tfvars_values(discovery: dict, import_folder: str) -> dict:
+		# DHCP Options
+		dhcp_options = discovery.get("dhcp_options") or {}
+		domain_name = dhcp_options.get("domain_name", "ec2.internal")
+		domain_name_servers = dhcp_options.get("domain_name_servers", ["AmazonProvidedDNS"])
+		ntp_servers = dhcp_options.get("ntp_servers", ["0.0.0.0"])
+		netbios_name_servers = dhcp_options.get("netbios_name_servers", ["192.168.1.1"])
+		netbios_node_type = dhcp_options.get("netbios_node_type", 2)
 	vpc = discovery.get("vpc") or {}
 	tags = vpc.get("tags") or []
 
@@ -307,6 +314,11 @@ def _extract_tfvars_values(discovery: dict, import_folder: str) -> dict:
 		"azs": azs,
 		"vpc_name": vpc_name_tag,
 		"state_folder": state_folder,
+		"domain_name": domain_name,
+		"domain_name_servers": domain_name_servers,
+		"ntp_servers": ntp_servers,
+		"netbios_name_servers": netbios_name_servers,
+		"netbios_node_type": netbios_node_type,
 	}
 
 
@@ -515,6 +527,13 @@ def _validate_tfvars_coverage(data: dict, vpc_endpoint_sg_ids: set) -> dict:
 
 
 def _write_tfvars(discovery_path: str, out_path: str) -> dict:
+		# DHCP Options
+		f.write("\n# DHCP Options\n")
+		f.write(f"domain_name          = \"{values['domain_name']}\"\n")
+		f.write(f"domain_name_servers  = {json.dumps(values['domain_name_servers'])}\n")
+		f.write(f"ntp_servers          = {json.dumps(values['ntp_servers'])}\n")
+		f.write(f"netbios_name_servers = {json.dumps(values['netbios_name_servers'])}\n")
+		f.write(f"netbios_node_type    = {values['netbios_node_type']}\n")
 	with open(discovery_path, "r") as f:
 		data = json.load(f)
 

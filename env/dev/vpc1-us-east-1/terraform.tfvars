@@ -1,3 +1,9 @@
+# DHCP Options
+domain_name          = "ec2.internal"
+domain_name_servers  = ["AmazonProvidedDNS"]
+ntp_servers          = ["0.0.0.0"]
+netbios_name_servers = ["192.168.1.1"]
+netbios_node_type    = 2
 base_tag = {
   Region       = "us-east-1"
   application  = "ntw"

@@ -1,29 +1,3 @@
-# DHCP Options variables
-variable "domain_name" {
-  description = "DHCP option: domain_name"
-  type        = string
-  default     = "ec2.internal"
-}
-variable "domain_name_servers" {
-  description = "DHCP option: domain_name_servers"
-  type        = list(string)
-  default     = ["AmazonProvidedDNS"]
-}
-variable "ntp_servers" {
-  description = "DHCP option: ntp_servers"
-  type        = list(string)
-  default     = ["0.0.0.0"]
-}
-variable "netbios_name_servers" {
-  description = "DHCP option: netbios_name_servers"
-  type        = list(string)
-  default     = ["192.168.1.1"]
-}
-variable "netbios_node_type" {
-  description = "DHCP option: netbios_node_type"
-  type        = number
-  default     = 2
-}
 variable "environment" {
   description = "Environment name (e.g., dev, prod)"
   type        = string
