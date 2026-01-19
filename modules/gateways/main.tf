@@ -27,9 +27,7 @@ resource "aws_nat_gateway" "public" {
   secondary_private_ip_addresses     = lookup(each.value, "secondary_private_ip_addresses", null)
   tags                               = merge(var.tags, { Name = lookup(each.value, "nat_name", "nat-public-${each.key}") })
 
-  lifecycle {
-    ignore_changes = [regional_nat_gateway_address]
-  }
+  # Removed ignore_changes for regional_nat_gateway_address (provider-managed, warning suppressed)
 }
 
 // Private NAT gateways (no public EIP)
@@ -44,7 +42,5 @@ resource "aws_nat_gateway" "private" {
   secondary_private_ip_addresses     = lookup(each.value, "secondary_private_ip_addresses", null)
   tags                               = merge(var.tags, { Name = lookup(each.value, "nat_name", "nat-private-${each.key}") })
 
-  lifecycle {
-    ignore_changes = [regional_nat_gateway_address]
-  }
+  # Removed ignore_changes for regional_nat_gateway_address (provider-managed, warning suppressed)
 }

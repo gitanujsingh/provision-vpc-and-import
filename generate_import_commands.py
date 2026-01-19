@@ -29,6 +29,19 @@ def _load_latest_discovery_json(import_dir: str) -> str:
 
 
 def _parse_tfvars(tfvars_path: str) -> Dict[str, Any]:
+        def parse_dhcp_option(name: str, default=None):
+            # Handles both string and list values
+            pattern_str = re.compile(rf"^\s*{re.escape(name)}\s*=\s*\"([^\"]*)\"\s*$")
+            pattern_list = re.compile(rf"^\s*{re.escape(name)}\s*=\s*\[(.*)\]\s*$")
+            for ln in lines:
+                m = pattern_str.match(ln)
+                if m:
+                    return m.group(1)
+                m = pattern_list.match(ln)
+                if m:
+                    # Parse comma-separated quoted values
+                    return [s.strip().strip('"') for s in m.group(1).split(',') if s.strip()]
+            return default
     if not os.path.isfile(tfvars_path):
         raise FileNotFoundError(tfvars_path)
 
@@ -59,6 +72,14 @@ def _parse_tfvars(tfvars_path: str) -> Dict[str, Any]:
             if m:
                 out.append(m.group(1))
         return out
+
+    def parse_bool(name: str) -> Optional[bool]:
+        pattern = re.compile(rf"^\s*{re.escape(name)}\s*=\s*(true|false)\s*$")
+        for ln in lines:
+            m = pattern.match(ln)
+            if m:
+                return m.group(1) == "true"
+        return None
 
     def parse_rule_numbers(list_name: str) -> List[int]:
         # Very small HCL-ish parser for:
@@ -94,7 +115,131 @@ def _parse_tfvars(tfvars_path: str) -> Dict[str, Any]:
             uniq.append(n)
         return uniq
 
-    return {
+    def parse_security_groups() -> Dict[str, Dict[str, str]]:
+        # Parse extra_security_groups map
+        # extra_security_groups = {
+        #   "key1" = {
+        #     name = "..."
+        #     description = "..."
+        #   }
+        # }
+        key_re = re.compile(r'^\s*\"([^\"]+)\"\s*=\s*\{\s*$')
+        name_re = re.compile(r'^\s*name\s*=\s*\"([^\"]+)\"\s*$')
+        in_sg_block = False
+        brace_depth = 0
+        sg_map = {}
+        current_key = None
+        
+        for ln in lines:
+            if re.match(r'^\s*extra_security_groups\s*=\s*\{\s*$', ln):
+                in_sg_block = True
+                brace_depth = 1
+                continue
+            if in_sg_block:
+                # Track braces
+                if '{' in ln:
+                    brace_depth += ln.count('{')
+                if '}' in ln:
+                    brace_depth -= ln.count('}')
+                if brace_depth == 0:
+                    break
+                    
+                # Extract SG key at depth 1
+                m = key_re.match(ln)
+                if m:
+                    current_key = m.group(1)
+                    sg_map[current_key] = {"name": current_key}  # Default to key name
+                    
+                # Extract name field
+                if current_key:
+                    m = name_re.match(ln)
+                    if m:
+                        sg_map[current_key]["name"] = m.group(1)
+        
+        return sg_map
+
+    def parse_interface_vpc_endpoints() -> List[str]:
+        # Parse interface_vpc_endpoints map keys
+        # interface_vpc_endpoints = {
+        #   "ec2" = { ... }
+        #   "ssm" = { ... }
+        # }
+        key_re = re.compile(r'^\s*\"([^\"]+)\"\s*=\s*\{\s*$')
+        in_ep_block = False
+        brace_depth = 0
+        ep_keys = []
+        for ln in lines:
+            if re.match(r'^\s*interface_vpc_endpoints\s*=\s*\{\s*$', ln):
+                in_ep_block = True
+                brace_depth = 1
+                continue
+            if in_ep_block:
+                # Track opening braces
+                if '{' in ln:
+                    brace_depth += ln.count('{')
+                # Track closing braces
+                if '}' in ln:
+                    brace_depth -= ln.count('}')
+                # If we're back to depth 0, we've exited the main block
+                if brace_depth == 0:
+                    break
+                # Extract endpoint key at depth 1
+                m = key_re.match(ln)
+                if m:
+                    ep_keys.append(m.group(1))
+        return ep_keys
+
+    def parse_extra_routes(tier: str) -> List[Dict[str, str]]:
+        # Parse <tier>_extra_routes list to get full route objects
+        # public_extra_routes = [
+        #   {
+        #     destination_cidr_block = "1.2.3.0/24"
+        #     target_type            = "transit_gateway_id"
+        #     target_id              = "tgw-xxx"
+        #   },
+        # ]
+        list_name = f"{tier}_extra_routes"
+        start_re = re.compile(rf"^\s*{re.escape(list_name)}\s*=\s*\[\s*$")
+        end_re = re.compile(r"^\s*\]\s*$")
+        obj_start_re = re.compile(r'^\s*\{\s*$')
+        obj_end_re = re.compile(r'^\s*\},?\s*$')
+        in_list = False
+        in_obj = False
+        routes = []
+        current_obj = {}
+        
+        for ln in lines:
+            if not in_list:
+                if start_re.match(ln):
+                    in_list = True
+                continue
+            if end_re.match(ln):
+                break
+            if not in_obj:
+                if obj_start_re.match(ln):
+                    in_obj = True
+                    current_obj = {}
+                continue
+            if obj_end_re.match(ln):
+                if current_obj:
+                    routes.append(current_obj)
+                in_obj = False
+                continue
+            
+            # Parse fields
+            m = re.search(r'destination_cidr_block\s*=\s*\"([^\"]+)\"', ln)
+            if m:
+                current_obj['destination_cidr_block'] = m.group(1)
+            m = re.search(r'target_type\s*=\s*\"([^\"]+)\"', ln)
+            if m:
+                current_obj['target_type'] = m.group(1)
+            m = re.search(r'target_id\s*=\s*\"([^\"]+)\"', ln)
+            if m:
+                current_obj['target_id'] = m.group(1)
+        
+        return routes
+
+    result = {
         "environment": parse_string("environment"),
         "region": parse_string("region"),
         "vpc_name": parse_string("vpc_name"),
@@ -109,7 +254,25 @@ def _parse_tfvars(tfvars_path: str) -> Dict[str, Any]:
         "nacl_public_egress_rule_numbers": parse_rule_numbers("public_egress"),
         "nacl_private_ingress_rule_numbers": parse_rule_numbers("private_ingress"),
         "nacl_private_egress_rule_numbers": parse_rule_numbers("private_egress"),
+        # Extra resources
+        "extra_security_groups": parse_security_groups(),
+        "public_extra_routes": parse_extra_routes("public"),
+        "private_extra_routes": parse_extra_routes("private"),
+        "nonroutable_extra_routes": parse_extra_routes("nonroutable"),
+        # Boolean flags
+        "enable_s3_gateway_endpoint": parse_bool("enable_s3_gateway_endpoint"),
+        "enable_interface_endpoints": parse_bool("enable_interface_endpoints"),
+        "enable_vpc_endpoints_sg": parse_bool("enable_vpc_endpoints_sg"),
+        # VPC endpoints
+        "interface_vpc_endpoints": parse_interface_vpc_endpoints(),
     }
+    # DHCP Options
+    result["domain_name"] = parse_dhcp_option("domain_name", "ec2.internal")
+    result["domain_name_servers"] = parse_dhcp_option("domain_name_servers", ["AmazonProvidedDNS"])
+    result["ntp_servers"] = parse_dhcp_option("ntp_servers", ["0.0.0.0"])
+    result["netbios_name_servers"] = parse_dhcp_option("netbios_name_servers", ["192.168.1.1"])
+    result["netbios_node_type"] = parse_dhcp_option("netbios_node_type", 2)
+    return result
 
 
 def _normalize_protocol(proto: Any) -> str:
@@ -117,6 +280,153 @@ def _normalize_protocol(proto: Any) -> str:
     if proto is None:
         return "-1"
     return str(proto).strip()
+
+
+def _validate_import_coverage(discovery: Dict[str, Any], tfv: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate that all importable resources from discovery JSON will get import commands."""
+    validation = {
+        'total_importable': 0,
+        'will_import': 0,
+        'skipped': [],
+        'warnings': []
+    }
+    
+    # VPC
+    if discovery.get('vpc'):
+        validation['total_importable'] += 1
+        validation['will_import'] += 1
+    
+    # CIDR associations (non-primary)
+    cidrs = [c for c in discovery.get('cidr_block_associations', []) if not c.get('primary')]
+    validation['total_importable'] += len(cidrs)
+    validation['will_import'] += len(cidrs)
+    
+    # Subnets
+    subnets = discovery.get('subnets', [])
+    for s in subnets:
+        validation['total_importable'] += 1
+        tier = (s.get('tier') or '').lower()
+        if tier in ['public', 'private', 'nonroutable']:
+            validation['will_import'] += 1
+        else:
+            validation['skipped'].append({
+                'type': 'subnet',
+                'id': s.get('id'),
+                'reason': f"Unknown tier '{tier}'"
+            })
+    
+    # Route tables
+    rts = discovery.get('route_tables', [])
+    validation['total_importable'] += len(rts)
+    validation['will_import'] += len(rts)
+    
+    # Route table associations
+    rtas = discovery.get('route_table_associations', [])
+    for rta in rtas:
+        validation['total_importable'] += 1
+        if rta.get('main'):
+            validation['skipped'].append({
+                'type': 'route_table_association',
+                'id': rta.get('id'),
+                'reason': 'Main route table association (AWS managed)'
+            })
+        else:
+            validation['will_import'] += 1
+    
+    # Security Groups (including default)
+    sgs = discovery.get('security_groups', [])
+    sg_keys_in_tfvars = set(tfv.get('extra_security_groups', {}).keys())
+    for sg in sgs:
+        validation['total_importable'] += 1
+        sg_name = sg.get('group_name', '')
+        # Sanitize sg_name to match the key generated in tfvars
+        sg_key = re.sub(r'[^a-zA-Z0-9_-]', '_', sg_name)
+        if sg_key not in sg_keys_in_tfvars:
+            validation['skipped'].append({
+                'type': 'security_group',
+                'id': sg.get('id'),
+                'reason': 'Not found in tfvars extra_security_groups map'
+            })
+        else:
+            validation['will_import'] += 1
+    
+    # NAT Gateways
+    nats = [n for n in discovery.get('nat_gateways', []) if n.get('state') != 'deleted']
+    validation['total_importable'] += len(nats)
+    validation['will_import'] += len(nats)
+    
+    # Internet Gateway
+    if discovery.get('internet_gateway'):
+        validation['total_importable'] += 1
+        validation['will_import'] += 1
+    
+    # VPC Endpoints
+    endpoints = discovery.get('vpc_endpoints', [])
+    validation['total_importable'] += len(endpoints)
+    enable_s3 = tfv.get('enable_s3_gateway_endpoint', False)
+    enable_interface = tfv.get('enable_interface_endpoints', False)
+    for ep in endpoints:
+        ep_type = ep.get('type', '')
+        if ep_type == 'Gateway' and not enable_s3:
+            validation['skipped'].append({
+                'type': 'vpc_endpoint',
+                'id': ep.get('id'),
+                'reason': 'Gateway endpoint but enable_s3_gateway_endpoint=false in tfvars'
+            })
+        elif ep_type == 'Interface' and not enable_interface:
+            validation['skipped'].append({
+                'type': 'vpc_endpoint',
+                'id': ep.get('id'),
+                'reason': 'Interface endpoint but enable_interface_endpoints=false in tfvars'
+            })
+        else:
+            validation['will_import'] += 1
+    
+    # DHCP Options
+    if discovery.get('dhcp_options'):
+        validation['total_importable'] += 2  # options + association
+        validation['will_import'] += 2
+    
+    # NACLs
+    nacls = discovery.get('network_acls', [])
+    for nacl in nacls:
+        validation['total_importable'] += 1
+        if nacl.get('is_default'):
+            validation['skipped'].append({
+                'type': 'nacl',
+                'id': nacl.get('id'),
+                'reason': 'Default NACL (AWS managed, will cause import errors)'
+            })
+        else:
+            validation['will_import'] += 1
+    
+    # Extra routes
+    routes = discovery.get('routes', [])
+    for r in routes:
+        dest = r.get('DestinationCidrBlock', '')
+        gw = r.get('GatewayId', '')
+        if dest and dest != '0.0.0.0/0' and not gw.startswith('local'):
+            validation['total_importable'] += 1
+            # Check if in tfvars
+            found_in_tfvars = False
+            for tier in ['public', 'private', 'nonroutable']:
+                tier_routes = tfv.get(f'{tier}_extra_routes', [])
+                for route in tier_routes:
+                    if route.get('destination_cidr_block') == dest:
+                        found_in_tfvars = True
+                        break
+                if found_in_tfvars:
+                    break
+            if found_in_tfvars:
+                validation['will_import'] += 1
+            else:
+                validation['skipped'].append({
+                    'type': 'route',
+                    'dest': dest,
+                    'reason': 'Not found in tfvars extra_routes'
+                })
+    
+    return validation
 
 
 def _emit_nacl_rule_imports(
@@ -219,6 +529,9 @@ def generate(import_dir: str, tfvars_path: str, discovery_json_path: str, out_pa
     tfv["_tfvars_path"] = tfvars_path
     vpc_name = tfv.get("vpc_name") or _tag_value((data.get("vpc") or {}).get("tags") or [], "Name") or "vpc"
 
+    # Validate import coverage
+    validation = _validate_import_coverage(data, tfv)
+
     public_cidrs = tfv.get("public_subnet_cidrs") or []
     private_cidrs = tfv.get("private_subnet_cidrs") or []
     nonroutable_cidrs = tfv.get("nonroutable_subnet_cidrs") or []
@@ -254,50 +567,92 @@ def generate(import_dir: str, tfvars_path: str, discovery_json_path: str, out_pa
         elif tier == "nonroutable" and cidr in nonroutable_cidrs:
             nonroutable_rt_by_cidr[cidr] = rt_id
 
-    # NACLs by Name tag (matches module naming)
-    public_nacl_name = f"ntw-{vpc_name}-public-nacl"
-    prn_nacl_name = f"ntw-{vpc_name}-private-nonroutable-nacl"
+    # NACLs by Name tag - find by matching pattern (more flexible)
+    # Look for NACLs with "public" and "private" in their names
     nacls = data.get("network_acls") or []
-    public_nacl = _find_by_tag_name(nacls, public_nacl_name)
-    prn_nacl = _find_by_tag_name(nacls, prn_nacl_name)
-
+    custom_nacls = [n for n in nacls if not n.get("is_default")]
+    
+    public_nacl = None
+    prn_nacl = None
+    
+    for nacl in custom_nacls:
+        name = (_tag_value(nacl.get("tags") or [], "Name") or "").lower()
+        if "public" in name and not "private" in name:
+            public_nacl = nacl
+        elif "private" in name or "nonroutable" in name:
+            prn_nacl = nacl
+    
     prn_nacl_id = (prn_nacl or {}).get("id") or ""
 
     # IGW
     igw_id = ((data.get("internet_gateway") or {}).get("id")) or ""
 
-    # NATs + EIPs: keyed by CIDR
+    # NATs + EIPs: Map NATs by checking each private/nonroutable subnet to find matching NAT
+    # Public NATs (with EIP) should map to private subnets for Terraform module keys
+    # Private NATs (no EIP) should map to nonroutable subnets for Terraform module keys
     nat_public_by_key: Dict[str, Dict[str, Any]] = {}
     nat_private_by_key: Dict[str, Dict[str, Any]] = {}
     eipalloc_by_key: Dict[str, str] = {}
 
-    for nat in data.get("nat_gateways") or []:
-        nat_id = nat.get("id")
-        name = _tag_value(nat.get("tags") or [], "Name")
-        if not nat_id or not name:
+    # Build lookup: NAT ID -> NAT data
+    nats_by_id = {nat.get("id"): nat for nat in data.get("nat_gateways") or [] if nat.get("id")}
+    
+    # For each private subnet, find a public NAT (by checking route tables for NAT gateway ID)
+    # For each nonroutable subnet, find a private NAT (by checking route tables for NAT gateway ID)
+    routes = data.get("routes") or []
+    
+    # Map route_table_id -> NAT gateway ID used in that route table
+    rt_nat_map: Dict[str, str] = {}
+    for route in routes:
+        rt_id = route.get("route_table_id")
+        nat_id = route.get("NatGatewayId")
+        if rt_id and nat_id and nat_id.startswith("nat-"):
+            rt_nat_map[rt_id] = nat_id
+    
+    # Map private subnets to public NATs via route tables
+    for cidr in private_cidrs:
+        rt_id = private_rt_by_cidr.get(cidr)
+        if not rt_id:
             continue
-        parsed = _extract_nat_key_from_name(name)
-        if not parsed:
+        nat_id = rt_nat_map.get(rt_id)
+        if not nat_id:
             continue
-        kind, key_cidr = parsed
-        if kind == "public" and key_cidr in private_cidrs:
-            nat_public_by_key[key_cidr] = nat
-            # allocation id for public NAT
+        nat = nats_by_id.get(nat_id)
+        if nat:
+            nat_public_by_key[cidr] = nat
+            # Get EIP allocation ID
             for addr in nat.get("nat_gateway_addresses") or []:
                 alloc = addr.get("AllocationId")
                 if alloc:
-                    eipalloc_by_key[key_cidr] = alloc
+                    eipalloc_by_key[cidr] = alloc
                     break
-        elif kind == "private" and key_cidr in nonroutable_cidrs:
-            nat_private_by_key[key_cidr] = nat
+    
+    # Map nonroutable subnets to private NATs via route tables
+    for cidr in nonroutable_cidrs:
+        rt_id = nonroutable_rt_by_cidr.get(cidr)
+        if not rt_id:
+            continue
+        nat_id = rt_nat_map.get(rt_id)
+        if not nat_id:
+            continue
+        nat = nats_by_id.get(nat_id)
+        if nat:
+            nat_private_by_key[cidr] = nat
 
     # EIPs: in JSON, id is allocation id
     eips_by_alloc = {e.get("id"): e for e in data.get("eips") or [] if e.get("id")}
 
-    # Security group: endpoints sg
+    # Security group: endpoints sg - find by matching "endpoint" in name
     sgs = data.get("security_groups") or []
-    endpoints_sg_name = f"{vpc_name}-endpoints-sg"
-    endpoints_sg = _find_by_tag_name(sgs, endpoints_sg_name)
+    custom_sgs = [sg for sg in sgs if not sg.get("is_default")]
+    
+    endpoints_sg = None
+    for sg in custom_sgs:
+        name = (_tag_value(sg.get("tags") or [], "Name") or "").lower()
+        if "endpoint" in name:
+            endpoints_sg = sg
+            break
+    
     endpoints_sg_id = (endpoints_sg or {}).get("id") or ""
 
     # VPC endpoints by service suffix
@@ -308,12 +663,9 @@ def generate(import_dir: str, tfvars_path: str, discovery_json_path: str, out_pa
         svc = (ep.get("service_name") or "")
         if not ep_id or not svc:
             continue
-        if svc.endswith(".s3"):
-            vpce_by_suffix["s3"] = ep_id
-        elif svc.endswith(".ec2"):
-            vpce_by_suffix["ec2"] = ep_id
-        elif svc.endswith(".ssm"):
-            vpce_by_suffix["ssm"] = ep_id
+        # Extract service name from format: com.amazonaws.<region>.<service>
+        service_suffix = svc.split(".")[-1]
+        vpce_by_suffix[service_suffix] = ep_id
 
     # DHCP
     dhcp_id = (data.get("dhcp_options") or {}).get("id") or ""
@@ -358,6 +710,65 @@ def generate(import_dir: str, tfvars_path: str, discovery_json_path: str, out_pa
     # Ensure we use the import backend before importing anything.
     lines.append('echo "Initializing Terraform backend (import backend-config)..."')
     lines.append("terraform init -reconfigure -backend-config=$BACKEND_CONFIG")
+    lines.append("\n")
+
+    # Print discovered resources summary (matching discovery script format)
+    lines.append('echo ""')
+    lines.append('echo "============================================================"')
+    lines.append('echo "DISCOVERED RESOURCES SUMMARY"')
+    lines.append('echo "============================================================"')
+    
+    # Count resources from discovery JSON
+    vpc_count = 1 if vpc_id else 0
+    primary_cidr = data.get('vpc', {}).get('cidr_block', 'N/A')
+    additional_cidrs_count = len(additional_cidrs)
+    public_subnets_count = len(public_cidrs)
+    private_subnets_count = len(private_cidrs)
+    nonroutable_subnets_count = len(nonroutable_cidrs)
+    total_subnets = public_subnets_count + private_subnets_count + nonroutable_subnets_count
+    
+    # Route tables
+    rt_count = len(data.get('route_tables', []))
+    
+    # Routes (exclude local routes which are AWS-managed)
+    routes = data.get('routes', [])
+    local_routes = [r for r in routes if r.get('GatewayId', '').startswith('local')]
+    importable_routes = [r for r in routes if not r.get('GatewayId', '').startswith('local')]
+    default_routes = sum(1 for r in importable_routes if r.get('DestinationCidrBlock') == '0.0.0.0/0')
+    extra_routes = [r for r in importable_routes if r.get('DestinationCidrBlock') != '0.0.0.0/0']
+    total_importable_routes = len(importable_routes)
+    
+    # NAT gateways
+    nats = data.get('nat_gateways', [])
+    public_nats = sum(1 for n in nats if n.get('connectivity_type') == 'public')
+    private_nats = sum(1 for n in nats if n.get('connectivity_type') == 'private')
+    
+    # VPC endpoints
+    endpoints = data.get('vpc_endpoints', [])
+    gateway_endpoints = sum(1 for ep in endpoints if ep.get('type') == 'Gateway')
+    interface_endpoints = sum(1 for ep in endpoints if ep.get('type') == 'Interface')
+    
+    # Security groups (including default)
+    sgs = data.get('security_groups', [])
+    default_sgs = sum(1 for sg in sgs if sg.get('is_default'))
+    custom_sgs = sum(1 for sg in sgs if not sg.get('is_default'))
+    
+    lines.append(f'echo "VPC: {vpc_count}"')
+    lines.append(f'echo "Primary CIDR Block: {primary_cidr}"')
+    lines.append(f'echo "Subnets: {total_subnets} (Public: {public_subnets_count}, Private: {private_subnets_count}, Nonroutable: {nonroutable_subnets_count})"')
+    lines.append(f'echo "Additional CIDR Blocks: {additional_cidrs_count}"')
+    lines.append(f'echo "Network ACLs: 2"')  # Always 2 (public and private+nonroutable)
+    lines.append(f'echo "Route Tables: {rt_count}"')
+    lines.append(f'echo "Routes: {total_importable_routes} (Default: {default_routes}, Extra: {len(extra_routes)})"')
+    lines.append(f'echo "NAT Gateways: {len(nats)} (Public: {public_nats}, Private: {private_nats})"')
+    eips_count = len(data.get('eips', []))
+    lines.append(f'echo "Elastic IPs: {eips_count}"')
+    lines.append(f'echo "Internet Gateway: {1 if data.get("internet_gateway") else 0}"')
+    lines.append(f'echo "VPC Endpoints: {len(endpoints)} (Gateway: {gateway_endpoints}, Interface: {interface_endpoints})"')
+    lines.append(f'echo "Security Groups: {len(sgs)} (Default: {default_sgs}, Custom: {custom_sgs})"')
+    lines.append(f'echo "DHCP Options: {1 if data.get("dhcp_options") else 0}"')
+    lines.append('echo "============================================================"')
+    lines.append('echo ""')
     lines.append("\n")
 
     lines.append("# Cache current state list (best effort)")
@@ -558,19 +969,108 @@ def generate(import_dir: str, tfvars_path: str, discovery_json_path: str, out_pa
         "DHCP association",
     )
 
-    # Security group for endpoints
-    _emit_import(lines, tfvars_posix, "module.vpc_endpoints_sg[0].aws_security_group.this", endpoints_sg_id, "VPC endpoints security group")
+    # Security group for endpoints - only import if module will be created
+    # Module count condition: enable_interface_endpoints && enable_vpc_endpoints_sg && length(vpc_endpoints_security_group_ids) == 0
+    enable_interface_endpoints = tfv.get("enable_interface_endpoints", False)
+    enable_vpc_endpoints_sg = tfv.get("enable_vpc_endpoints_sg", False)
+    vpc_endpoints_sg_ids = tfv.get("vpc_endpoints_security_group_ids", [])
+    
+    if enable_interface_endpoints and enable_vpc_endpoints_sg and len(vpc_endpoints_sg_ids) == 0 and endpoints_sg_id:
+        _emit_import(lines, tfvars_posix, "module.vpc_endpoints_sg[0].aws_security_group.this", endpoints_sg_id, "VPC endpoints security group")
+
+    # Extra security groups from tfvars (map of name -> sg definition)
+    extra_sgs = tfv.get("extra_security_groups", {})
+    sgs_by_name = {sg.get("group_name"): sg for sg in data.get("security_groups", []) if sg.get("group_name")}
+    
+    for sg_key, sg_config in extra_sgs.items():
+        # Match by the name in the tfvars configuration
+        sg_name = sg_config.get("name", "")
+        sg = sgs_by_name.get(sg_name)
+        if sg:
+            sg_id = sg.get("id", "")
+            addr = f'module.extra_security_groups["{sg_key}"].aws_security_group.this'
+            _emit_import(lines, tfvars_posix, addr, sg_id, f"security group {sg_name}")
 
     # VPC endpoints
     _emit_import(lines, tfvars_posix, "module.s3_vpc_endpoint[0].aws_vpc_endpoint.this", vpce_by_suffix.get("s3") or "", "S3 VPC endpoint")
-    _emit_import(lines, tfvars_posix, "module.ec2_vpc_endpoint[0].aws_vpc_endpoint.this", vpce_by_suffix.get("ec2") or "", "EC2 VPC endpoint")
-    _emit_import(lines, tfvars_posix, "module.ssm_vpc_endpoint[0].aws_vpc_endpoint.this", vpce_by_suffix.get("ssm") or "", "SSM VPC endpoint")
+    
+    # Interface VPC endpoints (dynamic based on tfvars)
+    interface_endpoints = tfv.get("interface_vpc_endpoints", [])
+    for service in interface_endpoints:
+        vpce_id = vpce_by_suffix.get(service, "")
+        if vpce_id:
+            addr = f'module.interface_vpc_endpoints["{service}"].aws_vpc_endpoint.this'
+            _emit_import(lines, tfvars_posix, addr, vpce_id, f"{service.upper()} VPC endpoint")
+
+
+    # Extra routes from tfvars
+    routes_by_rt_dest = {}
+    for route in data.get("routes", []):
+        rt_id = route.get("route_table_id", "")
+        dest = route.get("DestinationCidrBlock", "")
+        if rt_id and dest:
+            routes_by_rt_dest[f"{rt_id}_{dest}"] = route
+
+    # Public extra routes
+    for idx, route in enumerate(tfv.get("public_extra_routes", [])):
+        dest_cidr = route.get('destination_cidr_block', '')
+        target_type = route.get('target_type', '')
+        target_id = route.get('target_id', '')
+        if public_rt_id and dest_cidr and target_type and target_id:
+            # Key format in main.tf: "${r.destination_cidr_block}-${r.target_type}-${r.target_id}-${idx}"
+            route_key = f"{dest_cidr}-{target_type}-{target_id}-{idx}"
+            addr = f'aws_route.public_extra["{route_key}"]'
+            rid = f"{public_rt_id}_{dest_cidr}"
+            _emit_import(lines, tfvars_posix, addr, rid, f"public extra route {dest_cidr}")
+
+    # Private extra routes
+    for idx, route in enumerate(tfv.get("private_extra_routes", [])):
+        dest_cidr = route.get('destination_cidr_block', '')
+        target_type = route.get('target_type', '')
+        target_id = route.get('target_id', '')
+        if not (dest_cidr and target_type and target_id):
+            continue
+        # Key format in main.tf for private routes: "${rt_key}-${r_key}"
+        # where r_key = "${r.destination_cidr_block}-${r.target_type}-${r.target_id}-${idx}"
+        route_key = f"{dest_cidr}-{target_type}-{target_id}-{idx}"
+        for cidr in private_cidrs:
+            rt_id = private_rt_by_cidr.get(cidr, "")
+            if rt_id:
+                combined_key = f"{cidr}-{route_key}"
+                addr = f'aws_route.private_extra["{combined_key}"]'
+                rid = f"{rt_id}_{dest_cidr}"
+                _emit_import(lines, tfvars_posix, addr, rid, f"private extra route {cidr} -> {dest_cidr}")
+
+    # Nonroutable extra routes
+    for idx, route in enumerate(tfv.get("nonroutable_extra_routes", [])):
+        dest_cidr = route.get('destination_cidr_block', '')
+        target_type = route.get('target_type', '')
+        target_id = route.get('target_id', '')
+        if not (dest_cidr and target_type and target_id):
+            continue
+        # Key format in main.tf for nonroutable routes: "${rt_key}-${r_key}"
+        # where r_key = "${r.destination_cidr_block}-${r.target_type}-${r.target_id}-${idx}"
+        route_key = f"{dest_cidr}-{target_type}-{target_id}-{idx}"
+        for cidr in nonroutable_cidrs:
+            rt_id = nonroutable_rt_by_cidr.get(cidr, "")
+            if rt_id:
+                combined_key = f"{cidr}-{route_key}"
+                addr = f'aws_route.nonroutable_extra["{combined_key}"]'
+                rid = f"{rt_id}_{dest_cidr}"
+                _emit_import(lines, tfvars_posix, addr, rid, f"nonroutable extra route {cidr} -> {dest_cidr}")
 
     lines.append("\necho \"Done.\"\n")
-    lines.append('echo "Summary: imported=$IMPORTED skipped=$SKIPPED failed=$FAILED"')
+    lines.append('echo "============================================================"')
+    lines.append('echo "IMPORT SUMMARY"')
+    lines.append('echo "============================================================"')
+    lines.append('echo "Imported: $IMPORTED new resources"')
+    lines.append('echo "Skipped: $SKIPPED (already in state)"')
+    lines.append('echo "Failed: $FAILED"')
     lines.append('echo "Log: $LOG_FILE"')
     lines.append('echo ""')
-    lines.append('echo "Resource summary (from terraform state):"')
+    lines.append('echo "============================================================"')
+    lines.append('echo "TERRAFORM STATE SUMMARY"')
+    lines.append('echo "============================================================"')
     lines.append('VPC_ID=""')
     lines.append('VPC_ID=$(terraform state show -no-color module.vpc.aws_vpc.child_module 2>/dev/null | awk -F" = " \'/^[[:space:]]*id[[:space:]]*=[[:space:]]*/{gsub(/"/,"",$2); print $2; exit}\' || true)')
     lines.append('echo "VPC: ${VPC_ID:-unknown}"')
@@ -583,33 +1083,125 @@ def generate(import_dir: str, tfvars_path: str, discovery_json_path: str, out_pa
     lines.append('  grep -cE "$re" "$STATE_UNIQ_FILE" 2>/dev/null || echo 0')
     lines.append('}')
     lines.append('')
-    lines.append(r'SUBNETS=$(count_re "^module\\.(public|private|nonroutable)_subnets\\[\\\".*\\\"\\]\\.aws_subnet\\.child_module$")')
+    # Detailed subnet counting
+    lines.append(r'PUBLIC_SUBNETS=$(count_re "^module\\.public_subnets\\[\\\".*\\\"\\]\\.aws_subnet\\.child_module$")')
+    lines.append(r'PRIVATE_SUBNETS=$(count_re "^module\\.private_subnets\\[\\\".*\\\"\\]\\.aws_subnet\\.child_module$")')
+    lines.append(r'NONROUTABLE_SUBNETS=$(count_re "^module\\.nonroutable_subnets\\[\\\".*\\\"\\]\\.aws_subnet\\.child_module$")')
+    lines.append('SUBNETS=$((PUBLIC_SUBNETS + PRIVATE_SUBNETS + NONROUTABLE_SUBNETS))')
+    lines.append('')
+    lines.append(r'PRIMARY_CIDRS=$(count_re "^module\\.vpc\\.aws_vpc\\.child_module$")')
+    lines.append(r'ADDITIONAL_CIDRS=$(count_re "^module\\.vpc\\.aws_vpc_ipv4_cidr_block_association\\.additional\\[\\\".*\\\"\\]$")')
+    lines.append('TOTAL_CIDRS=$((PRIMARY_CIDRS + ADDITIONAL_CIDRS))')
     lines.append(r'NACLS=$(count_re "^module\\.nacls\\.aws_network_acl\\..+$")')
     lines.append(r'ROUTE_TABLES=$(count_re "^module\\.(public_route_table\\[0\\]|private_route_tables\\[\\\".*\\\"\\]|nonroutable_route_tables\\[\\\".*\\\"\\])\\.aws_route_table\\.this$")')
-    lines.append(r'NAT_GWS=$(count_re "^module\\.gateways\\.aws_nat_gateway\\.(public|private)\\[\\\".*\\\"\\]$")')
+    lines.append('')
+    # Detailed route table association counting
+    lines.append(r'PUBLIC_RT_ASSOCS=$(count_re "^module\\.public_route_table\\[0\\]\\.aws_route_table_association\\.this\\[\\\".*\\\"\\]$")')
+    lines.append(r'PRIVATE_RT_ASSOCS=$(count_re "^module\\.private_route_tables\\[\\\".*\\\"\\]\\.aws_route_table_association\\.this\\[\\\".*\\\"\\]$")')
+    lines.append(r'NONROUTABLE_RT_ASSOCS=$(count_re "^module\\.nonroutable_route_tables\\[\\\".*\\\"\\]\\.aws_route_table_association\\.this\\[\\\".*\\\"\\]$")')
+    lines.append('RT_ASSOCS=$((PUBLIC_RT_ASSOCS + PRIVATE_RT_ASSOCS + NONROUTABLE_RT_ASSOCS))')
+    lines.append('')
+    # Detailed route counting
+    lines.append(r'DEFAULT_ROUTES=$(count_re "^aws_route\\.(public|private|nonroutable)_default\\[.*\\]$")')
+    lines.append(r'EXTRA_ROUTES=$(count_re "^aws_route\\.(public|private|nonroutable)_extra\\[.*\\]$")')
+    lines.append('ROUTES=$((DEFAULT_ROUTES + EXTRA_ROUTES))')
+    lines.append('')
+    # Detailed NAT counting
+    lines.append(r'PUBLIC_NATS=$(count_re "^module\\.gateways\\.aws_nat_gateway\\.public\\[\\\".*\\\"\\]$")')
+    lines.append(r'PRIVATE_NATS=$(count_re "^module\\.gateways\\.aws_nat_gateway\\.private\\[\\\".*\\\"\\]$")')
+    lines.append('NAT_GWS=$((PUBLIC_NATS + PRIVATE_NATS))')
+    lines.append('')
     lines.append(r'EIPS=$(count_re "^module\\.gateways\\.aws_eip\\.nat_eip\\[\\\".*\\\"\\]$")')
     lines.append(r'IGW_COUNT=$(count_re "^module\\.gateways\\.aws_internet_gateway\\.igw\\[0\\]$")')
-    lines.append(r'VPCE=$(count_re "^module\\.(s3|ec2|ssm)_vpc_endpoint\\[0\\]\\.aws_vpc_endpoint\\.this$")')
-    lines.append(r'SGS=$(count_re "^module\\.vpc_endpoints_sg\\[0\\]\\.aws_security_group\\.this$")')
+    lines.append('')
+    # Detailed VPC endpoint counting
+    lines.append(r'GATEWAY_ENDPOINTS=$(count_re "^module\\.s3_vpc_endpoint\\[0\\]\\.aws_vpc_endpoint\\.this$")')
+    lines.append(r'INTERFACE_ENDPOINTS=$(count_re "^module\\.interface_vpc_endpoints\\[\\\".*\\\"\\]\\.aws_vpc_endpoint\\.this$")')
+    lines.append('VPCE=$((GATEWAY_ENDPOINTS + INTERFACE_ENDPOINTS))')
+    lines.append('')
+    # Detailed security group counting
+    lines.append(r'DEFAULT_SGS=$(terraform state list 2>/dev/null | grep "^module\\.extra_security_groups\\[\\\"default\\\"\\]\\.aws_security_group\\.this$" | wc -l || echo 0)')
+    lines.append(r'CUSTOM_SGS=$(terraform state list 2>/dev/null | grep "^module\\.extra_security_groups\\[" | grep -v "\\[\\\"default\\\"\\]" | wc -l || echo 0)')
+    lines.append('SGS=$((DEFAULT_SGS + CUSTOM_SGS))')
+    lines.append('')
     lines.append(r'DHCP_COUNT=$(count_re "^module\\.dhcp_options\\.aws_vpc_dhcp_options\\.this$")')
     lines.append('')
-    lines.append('echo "Subnets: $SUBNETS"')
+    lines.append('# Extract primary CIDR')
+    lines.append('PRIMARY_CIDR=$(terraform state show -no-color module.vpc.aws_vpc.child_module 2>/dev/null | awk \'/^[[:space:]]*cidr_block[[:space:]]*=/{cidr=$NF; gsub(/"/,"",cidr); print cidr; exit}\' || echo "unknown")')
+    lines.append('')
+    lines.append('echo "Subnets: $SUBNETS (Public: $PUBLIC_SUBNETS, Private: $PRIVATE_SUBNETS, Nonroutable: $NONROUTABLE_SUBNETS)"')
+    lines.append('echo "CIDR Blocks: $TOTAL_CIDRS (Primary: $PRIMARY_CIDRS, Additional: $ADDITIONAL_CIDRS)"')
+    lines.append('echo "  ├─ Primary: $PRIMARY_CIDR"')
+    lines.append('if [[ "$ADDITIONAL_CIDRS" -gt 0 ]]; then')
+    lines.append('  echo "  └─ Additional:"')
+    lines.append('  terraform state list 2>/dev/null | grep "^module\\\\.vpc\\\\.aws_vpc_ipv4_cidr_block_association\\\\.additional\\\\[" | while IFS= read -r cidr_resource; do')
+    lines.append('    cidr_block=$(terraform state show -no-color "$cidr_resource" 2>/dev/null | awk \'/^[[:space:]]*cidr_block[[:space:]]*=/{cidr=$NF; gsub(/"/,"",cidr); print cidr; exit}\' || echo "unknown")')
+    lines.append('    echo "      ├─ $cidr_block"')
+    lines.append('  done')
+    lines.append('fi')
     lines.append('echo "NACLs: $NACLS"')
     lines.append('echo "Route Tables: $ROUTE_TABLES"')
-    lines.append('echo "NAT Gateways: $NAT_GWS"')
+    lines.append('echo "Route Table Associations: $RT_ASSOCS"')
+    lines.append('echo "  ├─ Public: $PUBLIC_RT_ASSOCS"')
+    lines.append('echo "  ├─ Private: $PRIVATE_RT_ASSOCS"')
+    lines.append('echo "  └─ Nonroutable: $NONROUTABLE_RT_ASSOCS"')
+    lines.append('echo "Routes: $ROUTES (Default: $DEFAULT_ROUTES, Extra: $EXTRA_ROUTES)"')
+    lines.append('echo "NAT Gateways: $NAT_GWS (Public: $PUBLIC_NATS, Private: $PRIVATE_NATS)"')
     lines.append('echo "EIPs: $EIPS"')
-    lines.append('if [[ "$IGW_COUNT" -gt 0 ]]; then echo "IGW: yes"; else echo "IGW: no"; fi')
-    lines.append('echo "VPC Endpoints: $VPCE"')
-    lines.append('echo "Security Groups: $SGS"')
+    lines.append('echo "IGW: $IGW_COUNT"')
+    lines.append('echo "VPC Endpoints: $VPCE (Gateway: $GATEWAY_ENDPOINTS, Interface: $INTERFACE_ENDPOINTS)"')
+    lines.append('echo "Security Groups: $SGS (Default: $DEFAULT_SGS, Custom: $CUSTOM_SGS)"')
+    lines.append('')
+    lines.append('# List security group IDs and names')
+    lines.append('echo "  ├─ Default: $DEFAULT_SGS"')
+    lines.append('if [[ "$DEFAULT_SGS" -gt 0 ]]; then')
+    lines.append('  terraform state show -no-color module.extra_security_groups[\\\"default\\\"].aws_security_group.this 2>/dev/null | awk \'/^[[:space:]]*id[[:space:]]*=/{id=$NF; gsub(/"/,"",id)} /^[[:space:]]*name[[:space:]]*=/{name=$NF; gsub(/"/,"",name); print "  │   └─ " id " (" name ")"}\' || true')
+    lines.append('fi')
+    lines.append('echo "  └─ Custom: $CUSTOM_SGS"')
+    lines.append('if [[ "$CUSTOM_SGS" -gt 0 ]]; then')
+    lines.append('  terraform state list 2>/dev/null | grep "^module\\\\.extra_security_groups\\\\[" | grep -v \'\\["default"\\]\' | while IFS= read -r sg_resource; do')
+    lines.append('    sg_id=$(terraform state show -no-color "$sg_resource" 2>/dev/null | awk \'/^[[:space:]]*id[[:space:]]*=/{id=$NF; gsub(/"/,"",id); print id; exit}\' || echo "unknown")')
+    lines.append('    sg_name=$(terraform state show -no-color "$sg_resource" 2>/dev/null | awk \'/^[[:space:]]*name[[:space:]]*=/{name=$NF; gsub(/"/,"",name); print name; exit}\' || echo "unknown")')
+    lines.append('    echo "      ├─ $sg_id ($sg_name)"')
+    lines.append('  done | sed \'$ s/├/└/\'')  # Replace last ├ with └
+    lines.append('fi')
+    lines.append('')
     lines.append('if [[ "$DHCP_COUNT" -gt 0 ]]; then echo "DHCP Options: yes"; else echo "DHCP Options: no"; fi')
-    lines.append('echo "====================="')
+    lines.append('echo "============================================================"')
     lines.append('TOTAL_IMPORTED=$((IMPORTED+SKIPPED))')
-    lines.append('echo "Total resource imported: $TOTAL_IMPORTED"')
+    lines.append('echo "Total resources in state: $TOTAL_IMPORTED"')
+    lines.append('echo "============================================================"')
     lines.append('if [[ "$FAILED" -ne 0 ]]; then exit 1; fi')
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines))
+    
+    # Print validation report
+    print("\n" + "="*60)
+    print("IMPORT SCRIPT VALIDATION REPORT")
+    print("="*60)
+    print(f"Total importable resources in discovery JSON: {validation['total_importable']}")
+    print(f"Resources that will get import commands: {validation['will_import']}")
+    print(f"Resources skipped: {len(validation['skipped'])}")
+    
+    if validation['skipped']:
+        print("\nSkipped Resources (will NOT be imported):")
+        for skip in validation['skipped']:
+            skip_type = skip.get('type', 'unknown')
+            skip_id = skip.get('id', skip.get('dest', 'N/A'))
+            reason = skip.get('reason', 'No reason provided')
+            print(f"  • {skip_type}: {skip_id}")
+            print(f"    Reason: {reason}")
+    
+    if validation['warnings']:
+        print("\nWarnings:")
+        for warn in validation['warnings']:
+            print(f"  ⚠ {warn}")
+    
+    coverage_pct = (validation['will_import'] / validation['total_importable'] * 100) if validation['total_importable'] > 0 else 0
+    print(f"\nImport Coverage: {coverage_pct:.1f}% of discovered resources will be imported")
+    print("="*60 + "\n")
 
 
 def main() -> int:
