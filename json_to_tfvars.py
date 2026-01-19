@@ -675,6 +675,18 @@ def _write_tfvars(discovery_path: str, out_path: str) -> dict:
 	vpc_endpoint_sg_ids = _extract_vpc_endpoint_sgs(data)
 	validation = _validate_tfvars_coverage(data, vpc_endpoint_sg_ids)
 
+	# Build a map of route_table_id -> list of routes
+	routes_map = {}
+	for route in data.get('routes', []):
+		rt_id = route.get('route_table_id')
+		if not rt_id:
+			continue
+		if rt_id not in routes_map:
+			routes_map[rt_id] = []
+		# Remove route_table_id from the route dict for tfvars output
+		route_out = {k: v for k, v in route.items() if k != 'route_table_id'}
+		routes_map[rt_id].append(route_out)
+
 	def write_route_tables_block(name, tables):
 		f.write(f"{name} = [\n")
 		for rt in tables:
@@ -689,6 +701,16 @@ def _write_tfvars(discovery_path: str, out_path: str) -> dict:
 			for k, v in (rt['tags'] or {}).items():
 				f.write(f"      \"{k}\" = \"{v}\"\n")
 			f.write("    }\n")
+			# Inject routes if present
+			routes = routes_map.get(rt['id'], [])
+			if routes:
+				f.write(",\n    routes = [\n")
+				for r in routes:
+					# Write each route as a map
+					f.write("    { ")
+					f.write(", ".join(f"{k} = \"{v}\"" for k, v in r.items()))
+					f.write(" },\n")
+				f.write("  ]\n")
 			f.write("  },\n")
 		f.write("]\n")
 	
@@ -702,7 +724,36 @@ def _write_tfvars(discovery_path: str, out_path: str) -> dict:
 
 		f.write(f"environment = \"{values['env']}\"\n")
 		f.write(f"region      = \"{values['region']}\"\n\n")
-		f.write(f"vpc_cidr = \"{values['vpc_cidr']}\"\n\n")
+
+		# Provisioning toggles (move here)
+		f.write("# Provisioning toggles\n")
+		f.write("enable_additional_cidrs          = true\n")
+		f.write("enable_public_subnets            = true\n")
+		f.write("enable_private_subnets           = true\n")
+		f.write("enable_nonroutable_subnets       = true\n")
+		f.write("enable_gateways                  = true\n")
+		f.write("enable_internet_gateway          = true\n")
+		f.write("enable_public_nat_gateways       = true\n")
+		f.write("enable_private_nat_gateways      = true\n")
+		f.write("enable_public_route_table        = true\n")
+		f.write("enable_private_route_tables      = true\n")
+		f.write("enable_nonroutable_route_tables  = true\n")
+		f.write("enable_nacls                     = true\n")
+		f.write("enable_public_nacl               = true\n")
+		f.write("enable_private_nonroutable_nacl  = true\n")
+		f.write("enable_s3_gateway_endpoint       = true\n")
+		f.write("enable_interface_endpoints       = true\n")
+
+		# VPC endpoint security groups - set based on discovery
+		endpoint_sgs = _extract_vpc_endpoint_sgs(data)
+		if endpoint_sgs:
+			f.write("enable_vpc_endpoints_sg          = false  # Using existing SGs\n")
+			f.write(f"vpc_endpoints_security_group_ids = {json.dumps(endpoint_sgs)}\n")
+		else:
+			f.write("enable_vpc_endpoints_sg          = true\n")
+			f.write("vpc_endpoints_security_group_ids = []\n")
+
+		f.write(f"\nvpc_cidr = \"{values['vpc_cidr']}\"\n\n")
 
 		f.write("additional_cidrs = [\n")
 		for c in values["additional_cidrs"]:
