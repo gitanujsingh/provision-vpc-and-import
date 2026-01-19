@@ -263,13 +263,28 @@ def _extract_vpc_endpoint_sgs(discovery: dict) -> list:
 
 
 def _extract_tfvars_values(discovery: dict, import_folder: str) -> dict:
-		# DHCP Options
-		dhcp_options = discovery.get("dhcp_options") or {}
-		domain_name = dhcp_options.get("domain_name", "ec2.internal")
-		domain_name_servers = dhcp_options.get("domain_name_servers", ["AmazonProvidedDNS"])
-		ntp_servers = dhcp_options.get("ntp_servers", ["0.0.0.0"])
-		netbios_name_servers = dhcp_options.get("netbios_name_servers", ["192.168.1.1"])
-		netbios_node_type = dhcp_options.get("netbios_node_type", 2)
+	# --- BEGIN PATCH: Generate all nonroutable_extra_routes combinations ---
+	# Find all nonroutable subnet CIDRs
+	nonroutable_subnet_cidrs = [s.get("cidr_block") for s in discovery.get("subnets", []) if (s.get("tier") or '').lower() == "nonroutable"]
+	# Find all NAT gateway IDs (private NATs)
+	nat_gateway_ids = [g.get("id") for g in discovery.get("nat_gateways", []) if g.get("connectivity_type") == "private"]
+	# Generate all combinations for nonroutable_extra_routes
+	nonroutable_extra_routes = []
+	for subnet_cidr in nonroutable_subnet_cidrs:
+		for nat_id in nat_gateway_ids:
+			nonroutable_extra_routes.append({
+				"destination_cidr_block": "10.0.0.0/8",
+				"target_type": "nat_gateway_id",
+				"target_id": nat_id
+			})
+	# --- END PATCH ---
+	# DHCP Options
+	dhcp_options = discovery.get("dhcp_options") or {}
+	domain_name = dhcp_options.get("domain_name", "ec2.internal")
+	domain_name_servers = dhcp_options.get("domain_name_servers", ["AmazonProvidedDNS"])
+	ntp_servers = dhcp_options.get("ntp_servers", ["0.0.0.0"])
+	netbios_name_servers = dhcp_options.get("netbios_name_servers", ["192.168.1.1"])
+	netbios_node_type = dhcp_options.get("netbios_node_type", 2)
 	vpc = discovery.get("vpc") or {}
 	tags = vpc.get("tags") or []
 
@@ -319,6 +334,7 @@ def _extract_tfvars_values(discovery: dict, import_folder: str) -> dict:
 		"ntp_servers": ntp_servers,
 		"netbios_name_servers": netbios_name_servers,
 		"netbios_node_type": netbios_node_type,
+		"nonroutable_extra_routes": nonroutable_extra_routes,
 	}
 
 
@@ -362,10 +378,16 @@ def _to_rule_obj(entry: dict) -> dict:
 def _extract_nacl_rules(discovery: dict, vpc_name: str) -> dict:
 	# Build nacl_rules from discovery so import can bring rules into state and avoid duplicate rule_number errors.
 	nacls = discovery.get("network_acls") or []
+	# Try to find public and private NACLs by Name tag, fallback to first non-default NACLs if not found
 	public_nacl_name = f"ntw-{vpc_name}-public-nacl"
-	prn_nacl_name = f"ntw-{vpc_name}-private-nonroutable-nacl"
+	prn_nacl_name = f"ntw-{vpc_name}-private-nacl"
 	public_nacl = _find_by_tag_name(nacls, public_nacl_name)
 	prn_nacl = _find_by_tag_name(nacls, prn_nacl_name)
+	# Fallback: use first non-default NACLs if name match fails
+	if not public_nacl:
+		public_nacl = next((n for n in nacls if not n.get("is_default")), None)
+	if not prn_nacl:
+		prn_nacl = next((n for n in nacls if not n.get("is_default") and n != public_nacl), None)
 	public_id = (public_nacl or {}).get("id")
 	prn_id = (prn_nacl or {}).get("id")
 
@@ -527,13 +549,8 @@ def _validate_tfvars_coverage(data: dict, vpc_endpoint_sg_ids: set) -> dict:
 
 
 def _write_tfvars(discovery_path: str, out_path: str) -> dict:
-		# DHCP Options
-		f.write("\n# DHCP Options\n")
-		f.write(f"domain_name          = \"{values['domain_name']}\"\n")
-		f.write(f"domain_name_servers  = {json.dumps(values['domain_name_servers'])}\n")
-		f.write(f"ntp_servers          = {json.dumps(values['ntp_servers'])}\n")
-		f.write(f"netbios_name_servers = {json.dumps(values['netbios_name_servers'])}\n")
-		f.write(f"netbios_node_type    = {values['netbios_node_type']}\n")
+	# DHCP Options
+	# The following lines should be inside the file write block, not before reading the file
 	with open(discovery_path, "r") as f:
 		data = json.load(f)
 
@@ -724,23 +741,19 @@ def _write_tfvars(discovery_path: str, out_path: str) -> dict:
 			f.write("extra_security_groups = {}\n")
 		
 		# Extra routes discovered from AWS
-		rt_tier_map = _build_route_table_tier_map(data)
-		extra_routes = _extract_extra_routes(data, rt_tier_map)
-		
 		f.write("\n# Extra routes discovered from route tables\n")
-		for tier in ['public', 'private', 'nonroutable']:
-			routes = extra_routes.get(tier, [])
-			if routes:
-				f.write(f"{tier}_extra_routes = [\n")
-				for route in routes:
-					f.write("  {\n")
-					f.write(f"    destination_cidr_block = \"{route['destination_cidr_block']}\"\n")
-					f.write(f"    target_type            = \"{route['target_type']}\"\n")
-					f.write(f"    target_id              = \"{route['target_id']}\"\n")
-					f.write("  },\n")
-				f.write("]\n")
-			else:
-				f.write(f"{tier}_extra_routes = []\n")
+		# Use patched nonroutable_extra_routes logic
+		if values.get("nonroutable_extra_routes"):
+			f.write("nonroutable_extra_routes = [\n")
+			for route in values["nonroutable_extra_routes"]:
+				f.write("  {\n")
+				f.write(f"    destination_cidr_block = \"{route['destination_cidr_block']}\"\n")
+				f.write(f"    target_type            = \"{route['target_type']}\"\n")
+				f.write(f"    target_id              = \"{route['target_id']}\"\n")
+				f.write("  },\n")
+			f.write("]\n")
+		else:
+			f.write("nonroutable_extra_routes = []\n")
 
 	# Print validation report
 	print("\n" + "="*60)

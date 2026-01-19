@@ -29,19 +29,21 @@ def _load_latest_discovery_json(import_dir: str) -> str:
 
 
 def _parse_tfvars(tfvars_path: str) -> Dict[str, Any]:
-        def parse_dhcp_option(name: str, default=None):
-            # Handles both string and list values
-            pattern_str = re.compile(rf"^\s*{re.escape(name)}\s*=\s*\"([^\"]*)\"\s*$")
-            pattern_list = re.compile(rf"^\s*{re.escape(name)}\s*=\s*\[(.*)\]\s*$")
-            for ln in lines:
-                m = pattern_str.match(ln)
-                if m:
-                    return m.group(1)
-                m = pattern_list.match(ln)
-                if m:
-                    # Parse comma-separated quoted values
-                    return [s.strip().strip('"') for s in m.group(1).split(',') if s.strip()]
-            return default
+
+    def parse_dhcp_option(name: str, default=None):
+        # Handles both string and list values
+        pattern_str = re.compile(rf"^\s*{re.escape(name)}\s*=\s*\"([^\"]*)\"\s*$")
+        pattern_list = re.compile(rf"^\s*{re.escape(name)}\s*=\s*\[(.*)\]\s*$")
+        for ln in lines:
+            m = pattern_str.match(ln)
+            if m:
+                return m.group(1)
+            m = pattern_list.match(ln)
+            if m:
+                # Parse comma-separated quoted values
+                return [s.strip().strip('"') for s in m.group(1).split(',') if s.strip()]
+        return default
+
     if not os.path.isfile(tfvars_path):
         raise FileNotFoundError(tfvars_path)
 
@@ -1048,16 +1050,15 @@ def generate(import_dir: str, tfvars_path: str, discovery_json_path: str, out_pa
         target_id = route.get('target_id', '')
         if not (dest_cidr and target_type and target_id):
             continue
-        # Key format in main.tf for nonroutable routes: "${rt_key}-${r_key}"
-        # where r_key = "${r.destination_cidr_block}-${r.target_type}-${r.target_id}-${idx}"
         route_key = f"{dest_cidr}-{target_type}-{target_id}-{idx}"
         for cidr in nonroutable_cidrs:
             rt_id = nonroutable_rt_by_cidr.get(cidr, "")
-            if rt_id:
-                combined_key = f"{cidr}-{route_key}"
-                addr = f'aws_route.nonroutable_extra["{combined_key}"]'
-                rid = f"{rt_id}_{dest_cidr}"
-                _emit_import(lines, tfvars_posix, addr, rid, f"nonroutable extra route {cidr} -> {dest_cidr}")
+            combined_key = f"{cidr}-{route_key}"
+            addr = f'aws_route.nonroutable_extra["{combined_key}"]'
+            rid = f"{rt_id}_{dest_cidr}" if rt_id else f"missingrt_{cidr}_{dest_cidr}"
+            if not rt_id:
+                print(f"WARNING: No route table found for nonroutable subnet {cidr} (route {combined_key})")
+            _emit_import(lines, tfvars_posix, addr, rid, f"nonroutable extra route {cidr} -> {dest_cidr}")
 
     lines.append("\necho \"Done.\"\n")
     lines.append('echo "============================================================"')
