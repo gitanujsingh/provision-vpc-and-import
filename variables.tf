@@ -1,3 +1,9 @@
+# Toggle for DHCP Option Set
+variable "enable_dhcp_option_set" {
+  description = "If false, do not create or associate a DHCP option set."
+  type        = bool
+  default     = true
+}
 # DHCP Options variables
 variable "domain_name" {
   description = "DHCP option: domain_name"

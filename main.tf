@@ -1,3 +1,15 @@
+# Only create DHCP option set if enabled
+module "dhcp_options" {
+  source = "./modules/dhcp-options"
+  count  = var.enable_dhcp_option_set ? 1 : 0
+  vpc_id = module.vpc.id
+  domain_name = var.domain_name
+  domain_name_servers = var.domain_name_servers
+  ntp_servers = var.ntp_servers
+  netbios_name_servers = var.netbios_name_servers
+  netbios_node_type = var.netbios_node_type
+  tags = var.base_tag
+}
 locals {
   additional_cidrs = var.enable_additional_cidrs ? var.additional_cidrs : []
 

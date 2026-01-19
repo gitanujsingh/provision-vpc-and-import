@@ -263,79 +263,181 @@ def _extract_vpc_endpoint_sgs(discovery: dict) -> list:
 
 
 def _extract_tfvars_values(discovery: dict, import_folder: str) -> dict:
-	# --- BEGIN PATCH: Generate all nonroutable_extra_routes combinations ---
-	# Find all nonroutable subnet CIDRs
-	nonroutable_subnet_cidrs = [s.get("cidr_block") for s in discovery.get("subnets", []) if (s.get("tier") or '').lower() == "nonroutable"]
-	# Find all NAT gateway IDs (private NATs)
-	nat_gateway_ids = [g.get("id") for g in discovery.get("nat_gateways", []) if g.get("connectivity_type") == "private"]
-	# Generate all combinations for nonroutable_extra_routes
-	nonroutable_extra_routes = []
-	for subnet_cidr in nonroutable_subnet_cidrs:
-		for nat_id in nat_gateway_ids:
-			nonroutable_extra_routes.append({
-				"destination_cidr_block": "10.0.0.0/8",
-				"target_type": "nat_gateway_id",
-				"target_id": nat_id
-			})
-	# --- END PATCH ---
-	# DHCP Options
-	dhcp_options = discovery.get("dhcp_options") or {}
-	domain_name = dhcp_options.get("domain_name", "ec2.internal")
-	domain_name_servers = dhcp_options.get("domain_name_servers", ["AmazonProvidedDNS"])
-	ntp_servers = dhcp_options.get("ntp_servers", ["0.0.0.0"])
-	netbios_name_servers = dhcp_options.get("netbios_name_servers", ["192.168.1.1"])
-	netbios_node_type = dhcp_options.get("netbios_node_type", 2)
-	vpc = discovery.get("vpc") or {}
-	tags = vpc.get("tags") or []
+		print("[DEBUG] Entering _extract_tfvars_values")
+		# Initialize extra routes to avoid UnboundLocalError
+		public_extra_routes = []
+		private_extra_routes = []
+		nonroutable_extra_routes = []
+		try:
+			# Build full route table objects for tfvars
+			required_fields = [
+				'env', 'region', 'vpc_cidr', 'additional_cidrs', 'public_subnet_cidrs',
+				'private_subnet_cidrs', 'nonroutable_subnet_cidrs', 'azs', 'vpc_name',
+				'state_folder', 'public_route_tables', 'private_route_tables', 'nonroutable_route_tables',
+				   'public_extra_routes', 'private_extra_routes',
+				'public_route_table_id', 'private_route_table_ids', 'nonroutable_route_table_ids'
+			]
+			print(f"[DEBUG] route_tables count: {len(discovery.get('route_tables', []))}")
+			print(f"[DEBUG] subnets count: {len(discovery.get('subnets', []))}")
+			print(f"[DEBUG] route_table_associations count: {len(discovery.get('route_table_associations', []))}")
+			public_route_tables = []
+			private_route_tables = []
+			nonroutable_route_tables = []
+			# Build lookup maps for associations and subnets
+			associations = {a['route_table_id']: a for a in discovery.get('route_table_associations', []) if 'route_table_id' in a}
+			subnet_tiers = {s['id']: (s.get('tier') or '').lower() for s in discovery.get('subnets', []) if 'id' in s}
+			vpc_id = (discovery.get('vpc') or {}).get('id', '')
 
-	env = _tag_value(tags, "environment") or "dev"
-	vpc_name_tag = _tag_value(tags, "Name") or _tag_value(tags, "Environment") or env
-	region = _infer_region(discovery)
+			for rt in discovery.get('route_tables', []):
+				assoc = associations.get(rt.get('id'), {})
+				subnet_id = assoc.get('subnet_id', '')
+				tier = subnet_tiers.get(subnet_id, '')
+				guessed = False
+				# fallback: if no subnet, try to infer from name
+				if not tier:
+					name = ''
+					for tag in rt.get('tags', []):
+						if tag.get('Key') == 'Name':
+							name = tag.get('Value', '').lower()
+					if 'public' in name:
+						tier = 'public'
+					elif 'nonroutable' in name or 'nr' in name:
+						tier = 'nonroutable'
+					elif 'private' in name or 'pvt' in name:
+						tier = 'private'
+					else:
+						tier = 'private'  # default fallback
+					guessed = True
+				if guessed:
+					print(f"[WARN] Route table {rt.get('id')} had no subnet association or tier, guessed tier as '{tier}' from name '{name}'", file=sys.stderr)
+				obj = {
+					'id': rt.get('id'),
+					'name': next((tag.get('Value') for tag in rt.get('tags', []) if tag.get('Key') == 'Name'), ''),
+					'tags': {tag.get('Key'): tag.get('Value') for tag in rt.get('tags', []) if tag.get('Key')},
+					'tier': tier,
+					'vpc_id': vpc_id,
+					'subnet_id': subnet_id,
+					'main': assoc.get('main', False),
+				}
+				# Always include the route table, even if tier was guessed
+				if obj['tier'] == 'public':
+					public_route_tables.append(obj)
+				elif obj['tier'] == 'private':
+					private_route_tables.append(obj)
+				elif obj['tier'] == 'nonroutable':
+					nonroutable_route_tables.append(obj)
+				else:
+					# If tier is still not recognized, default to private and warn
+					print(f"[WARN] Route table {rt.get('id')} has unrecognized tier '{obj['tier']}', defaulting to 'private'", file=sys.stderr)
+					private_route_tables.append(obj)
+					# Extract extra routes for all tiers
+					route_tables = {rt.get('id'): (rt.get('tier') or 'private').lower() for rt in discovery.get('route_tables', [])}
+					extra_routes = _extract_extra_routes(discovery, route_tables)
+					public_extra_routes = extra_routes.get('public', [])
+					private_extra_routes = extra_routes.get('private', [])
+					# nonroutable_extra_routes = extra_routes.get('nonroutable', [])
+					nonroutable_extra_routes = extra_routes.get('nonroutable', [])
 
-	vpc_cidr = vpc.get("cidr_block") or ""
+			# Route table ID mappings for reference
+			public_route_table_id = ''
+			private_route_table_ids = []
+			nonroutable_route_table_ids = []
+			for rt in discovery.get('route_tables', []):
+				tier = (rt.get('tier') or 'private').lower()
+				if tier == 'public':
+					public_route_table_id = rt.get('id')
+				elif tier == 'private':
+					private_route_table_ids.append(rt.get('id'))
+				elif tier == 'nonroutable':
+					nonroutable_route_table_ids.append(rt.get('id'))
+			# DHCP Options - extract from DhcpConfigurations if present
+			dhcp_options = discovery.get("dhcp_options") or {}
+			dhcp_conf = (dhcp_options.get("options") or {}).get("DhcpConfigurations") or []
+			def get_dhcp_value(key, default=None, as_list=False):
+				for conf in dhcp_conf:
+					if conf.get("Key") == key:
+						vals = [v.get("Value") for v in conf.get("Values", []) if v.get("Value") is not None]
+						if as_list:
+							return vals if vals else (default if default is not None else [])
+						return vals[0] if vals else (default if default is not None else "")
+				return default if default is not None else ([] if as_list else "")
+			domain_name = get_dhcp_value("domain-name", "ec2.internal")
+			domain_name_servers = get_dhcp_value("domain-name-servers", ["AmazonProvidedDNS"], as_list=True)
+			ntp_servers = get_dhcp_value("ntp-servers", ["0.0.0.0"], as_list=True)
+			netbios_name_servers = get_dhcp_value("netbios-name-servers", ["192.168.1.1"], as_list=True)
+			netbios_node_type = get_dhcp_value("netbios-node-type", 2)
+			vpc = discovery.get("vpc") or {}
+			tags = vpc.get("tags") or []
 
-	additional = []
-	if isinstance(discovery.get("cidr_block_associations"), list):
-		additional = [
-			a.get("cidr_block")
-			for a in discovery.get("cidr_block_associations") or []
-			if a.get("cidr_block") and not a.get("primary")
-		]
-	else:
-		additional = vpc.get("additional_cidrs") or []
-	# Ensure the primary VPC CIDR is not treated as an additional CIDR.
-	additional = [c for c in additional if c and c != vpc_cidr]
-	additional = _sorted_cidrs(additional)
+			env = _tag_value(tags, "environment") or "dev"
+			vpc_name_tag = _tag_value(tags, "Name") or _tag_value(tags, "Environment") or env
+			region = _infer_region(discovery)
 
-	subnets = discovery.get("subnets") or []
-	public = _sorted_cidrs([s.get("cidr_block") for s in subnets if (s.get("tier") or "").lower() == "public"])
-	private = _sorted_cidrs([s.get("cidr_block") for s in subnets if (s.get("tier") or "").lower() == "private"])
-	nonroutable = _sorted_cidrs(
-		[s.get("cidr_block") for s in subnets if (s.get("tier") or "").lower() == "nonroutable"]
-	)
+			vpc_cidr = vpc.get("cidr_block") or ""
 
-	azs = sorted({s.get("az") for s in subnets if s.get("az")})
+			additional = []
+			if isinstance(discovery.get("cidr_block_associations"), list):
+				additional = [
+					a.get("cidr_block")
+					for a in discovery.get("cidr_block_associations") or []
+					if a.get("cidr_block") and not a.get("primary")
+				]
+			else:
+				additional = vpc.get("additional_cidrs") or []
+			# Ensure the primary VPC CIDR is not treated as an additional CIDR.
+			additional = [c for c in additional if c and c != vpc_cidr]
+			additional = _sorted_cidrs(additional)
 
-	state_folder = _state_folder_name(import_folder, vpc_name_tag)
+			subnets = discovery.get("subnets") or []
+			public = _sorted_cidrs([s.get("cidr_block") for s in subnets if (s.get("tier") or "").lower() == "public"])
+			private = _sorted_cidrs([s.get("cidr_block") for s in subnets if (s.get("tier") or "").lower() == "private"])
+			nonroutable = _sorted_cidrs(
+				[s.get("cidr_block") for s in subnets if (s.get("tier") or "").lower() == "nonroutable"]
+			)
 
-	return {
-		"env": env,
-		"region": region,
-		"vpc_cidr": vpc_cidr,
-		"additional_cidrs": additional,
-		"public_subnet_cidrs": public,
-		"private_subnet_cidrs": private,
-		"nonroutable_subnet_cidrs": nonroutable,
-		"azs": azs,
-		"vpc_name": vpc_name_tag,
-		"state_folder": state_folder,
-		"domain_name": domain_name,
-		"domain_name_servers": domain_name_servers,
-		"ntp_servers": ntp_servers,
-		"netbios_name_servers": netbios_name_servers,
-		"netbios_node_type": netbios_node_type,
-		"nonroutable_extra_routes": nonroutable_extra_routes,
-	}
+			azs = sorted({s.get("az") for s in subnets if s.get("az")})
+
+			state_folder = _state_folder_name(import_folder, vpc_name_tag)
+
+			result = {
+				"env": env,
+				"region": region,
+				"vpc_cidr": vpc_cidr,
+				"additional_cidrs": additional,
+				"public_subnet_cidrs": public,
+				"private_subnet_cidrs": private,
+				"nonroutable_subnet_cidrs": nonroutable,
+				"azs": azs,
+				"vpc_name": vpc_name_tag,
+				"state_folder": state_folder,
+				"domain_name": domain_name,
+				"domain_name_servers": domain_name_servers,
+				"ntp_servers": ntp_servers,
+				"netbios_name_servers": netbios_name_servers,
+				"netbios_node_type": netbios_node_type,
+				"public_extra_routes": public_extra_routes,
+				"private_extra_routes": private_extra_routes,
+				   "nonroutable_extra_routes": nonroutable_extra_routes,
+				"public_route_table_id": public_route_table_id,
+				"private_route_table_ids": private_route_table_ids,
+				"nonroutable_route_table_ids": nonroutable_route_table_ids,
+				"public_route_tables": public_route_tables,
+				"private_route_tables": private_route_tables,
+				"nonroutable_route_tables": nonroutable_route_tables,
+			}
+			# Check for missing required fields
+			print(f"[DEBUG] Final tfvars result: {json.dumps(result, indent=2)[:1000]}...")
+			missing = [k for k in required_fields if k not in result or result[k] is None]
+			if missing:
+				print(f"ERROR: Missing required fields in tfvars generation: {missing}", file=sys.stderr)
+				print(f"Discovery input: {json.dumps(discovery)[:1000]}...", file=sys.stderr)
+				raise ValueError(f"Missing required fields for tfvars: {missing}")
+			print("[DEBUG] _extract_tfvars_values returning:", result)
+			return result
+		except Exception as e:
+			print(f"[DEBUG] Exception in _extract_tfvars_values: {e}", file=sys.stderr)
+			import traceback; traceback.print_exc()
+			return {}
 
 
 def _find_by_tag_name(items, name_value: str):
@@ -549,20 +651,46 @@ def _validate_tfvars_coverage(data: dict, vpc_endpoint_sg_ids: set) -> dict:
 
 
 def _write_tfvars(discovery_path: str, out_path: str) -> dict:
-	# DHCP Options
-	# The following lines should be inside the file write block, not before reading the file
-	with open(discovery_path, "r") as f:
-		data = json.load(f)
-
+	print(f"[DEBUG] Entering _write_tfvars for {discovery_path}, out_path={out_path}")
+	# Output full route table objects for all tiers
+	print(f"[DEBUG] Entering _write_tfvars for {discovery_path}, out_path={out_path}")
+	with open(discovery_path) as f_json:
+		data = json.load(f_json)
 	out_dir = os.path.dirname(out_path)
 	values = _extract_tfvars_values(data, out_dir)
+	print(f"[DEBUG] _extract_tfvars_values returned: {type(values)} {values if isinstance(values, dict) else ''}")
+	# Return values after writing file
+	if not values:
+		print("ERROR: No values generated for tfvars.", file=sys.stderr)
+		raise ValueError("No values generated for tfvars.")
+	# Validate required keys for backend config
+	required_keys = ["env", "state_folder", "region"]
+	missing = [k for k in required_keys if k not in values or not values[k]]
+	if missing:
+		print(f"ERROR: Missing required backend keys: {missing}", file=sys.stderr)
+		print(f"Values: {json.dumps(values)}", file=sys.stderr)
+		raise ValueError(f"Missing required backend keys: {missing}")
+
 	nacl_rules = _extract_nacl_rules(data, values["vpc_name"])
-	
-	# Extract VPC endpoint SG IDs first
 	vpc_endpoint_sg_ids = _extract_vpc_endpoint_sgs(data)
-	
-	# Validate coverage
 	validation = _validate_tfvars_coverage(data, vpc_endpoint_sg_ids)
+
+	def write_route_tables_block(name, tables):
+		f.write(f"{name} = [\n")
+		for rt in tables:
+			f.write("  {\n")
+			f.write(f"    id = \"{rt['id']}\"\n")
+			f.write(f"    name = \"{rt['name']}\"\n")
+			f.write(f"    vpc_id = \"{rt['vpc_id']}\"\n")
+			f.write(f"    subnet_id = \"{rt.get('subnet_id', '')}\"\n")
+			f.write(f"    tier = \"{rt['tier']}\"\n")
+			f.write(f"    main = {str(rt.get('main', False)).lower()}\n")
+			f.write("    tags = {\n")
+			for k, v in (rt['tags'] or {}).items():
+				f.write(f"      \"{k}\" = \"{v}\"\n")
+			f.write("    }\n")
+			f.write("  },\n")
+		f.write("]\n")
 	
 	with open(out_path, "w", newline="\n") as f:
 		f.write("base_tag = {\n")
@@ -602,6 +730,30 @@ def _write_tfvars(discovery_path: str, out_path: str) -> dict:
 		f.write("]\n\n")
 
 		f.write(f"vpc_name = \"{values['vpc_name']}\"\n")
+
+		# Route table objects for all tiers
+		f.write("\n# Route table objects for all tiers\n")
+		write_route_tables_block("public_route_tables", values.get("public_route_tables", []))
+		write_route_tables_block("private_route_tables", values.get("private_route_tables", []))
+		write_route_tables_block("nonroutable_route_tables", values.get("nonroutable_route_tables", []))
+
+		# DHCP Option Set values
+		f.write("\n# DHCP Option Set\n")
+		f.write("enable_dhcp_option_set = true\n")
+		f.write(f"domain_name = \"{values['domain_name']}\"\n")
+		f.write("domain_name_servers = [\n")
+		for s in values["domain_name_servers"]:
+			f.write(f"  \"{s}\",\n")
+		f.write("]\n")
+		f.write("ntp_servers = [\n")
+		for s in values["ntp_servers"]:
+			f.write(f"  \"{s}\",\n")
+		f.write("]\n")
+		f.write("netbios_name_servers = [\n")
+		for s in values["netbios_name_servers"]:
+			f.write(f"  \"{s}\",\n")
+		f.write("]\n")
+		f.write(f"netbios_node_type = {values['netbios_node_type']}\n")
 
 		# Provisioning toggles (so import + lifecycle can be controlled via tfvars)
 		f.write("\n# Provisioning toggles\n")
@@ -740,20 +892,34 @@ def _write_tfvars(discovery_path: str, out_path: str) -> dict:
 			f.write("\n# No additional security groups discovered\n")
 			f.write("extra_security_groups = {}\n")
 		
-		# Extra routes discovered from AWS
-		f.write("\n# Extra routes discovered from route tables\n")
-		# Use patched nonroutable_extra_routes logic
-		if values.get("nonroutable_extra_routes"):
-			f.write("nonroutable_extra_routes = [\n")
-			for route in values["nonroutable_extra_routes"]:
-				f.write("  {\n")
-				f.write(f"    destination_cidr_block = \"{route['destination_cidr_block']}\"\n")
-				f.write(f"    target_type            = \"{route['target_type']}\"\n")
-				f.write(f"    target_id              = \"{route['target_id']}\"\n")
-				f.write("  },\n")
+			# Extra routes discovered from AWS
+			f.write("\n# Extra routes discovered from route tables\n")
+			# Output all extra routes including nonroutable_extra_routes
+			for tier in ["public", "private", "nonroutable"]:
+				key = f"{tier}_extra_routes"
+				if values.get(key):
+					f.write(f"{key} = [\n")
+					for route in values[key]:
+						f.write("  {\n")
+						f.write(f"    destination_cidr_block = \"{route['destination_cidr_block']}\"\n")
+						f.write(f"    target_type            = \"{route['target_type']}\"\n")
+						f.write(f"    target_id              = \"{route['target_id']}\"\n")
+						f.write("  },\n")
+					f.write("]\n")
+				else:
+					f.write(f"{key} = []\n")
+
+			# Output route table ID mappings for reference
+			f.write("\n# Route table IDs for reference\n")
+			f.write(f"public_route_table_id = \"{values.get('public_route_table_id', '')}\"\n")
+			f.write("private_route_table_ids = [\n")
+			for rid in values.get('private_route_table_ids', []):
+				f.write(f"  \"{rid}\",\n")
 			f.write("]\n")
-		else:
-			f.write("nonroutable_extra_routes = []\n")
+			f.write("nonroutable_route_table_ids = [\n")
+			for rid in values.get('nonroutable_route_table_ids', []):
+				f.write(f"  \"{rid}\",\n")
+			f.write("]\n")
 
 	# Print validation report
 	print("\n" + "="*60)
@@ -785,6 +951,7 @@ def _write_tfvars(discovery_path: str, out_path: str) -> dict:
 
 
 def main() -> int:
+	print("[DEBUG] Entering main()")
 	parser = argparse.ArgumentParser(description="Generate terraform.tfvars under *-import folders from discovery JSON.")
 	parser.add_argument(
 		"path",
@@ -805,7 +972,9 @@ def main() -> int:
 	args = parser.parse_args()
 
 	target_dir = os.getcwd()
+	print(f"[DEBUG] CWD: {target_dir}")
 	json_files = glob.glob(os.path.join(target_dir, 'env', '*', '*-import', 'vpc_resources_vpc-*.json'))
+	print(f"[DEBUG] Found {len(json_files)} discovery JSON files")
 	if not json_files:
 		print("No vpc_resources_vpc-*.json file found in env/*/*-import/", file=sys.stderr)
 		return 1
@@ -813,11 +982,14 @@ def main() -> int:
 	selected_files = []
 	if args.path:
 		p = args.path
+		print(f"[DEBUG] args.path provided: {p}")
 		if os.path.isdir(p):
 			selected_files = sorted(glob.glob(os.path.join(p, 'vpc_resources_vpc-*.json')))
+			print(f"[DEBUG] Directory mode, found: {selected_files}")
 			if selected_files:
 				selected_files = [selected_files[-1]]
 		elif os.path.isfile(p) and os.path.basename(p).startswith('vpc_resources_vpc-'):
+			print(f"[DEBUG] File mode, using: {p}")
 			selected_files = [p]
 		else:
 			print(f"Invalid path: {p}", file=sys.stderr)
@@ -842,6 +1014,7 @@ def main() -> int:
 			indices = [int(i) for i in sel.split(',') if i.strip().isdigit()]
 			selected_files = [json_files[i-1] for i in indices if 0 < i <= len(json_files)]
 
+	print(f"[DEBUG] Selected files: {selected_files}")
 	if not selected_files:
 		print("No valid discovery JSON selected.", file=sys.stderr)
 		return 1
