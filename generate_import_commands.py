@@ -29,19 +29,19 @@ def _load_latest_discovery_json(import_dir: str) -> str:
 
 
 def _parse_tfvars(tfvars_path: str) -> Dict[str, Any]:
-        def parse_dhcp_option(name: str, default=None):
-            # Handles both string and list values
-            pattern_str = re.compile(rf"^\s*{re.escape(name)}\s*=\s*\"([^\"]*)\"\s*$")
-            pattern_list = re.compile(rf"^\s*{re.escape(name)}\s*=\s*\[(.*)\]\s*$")
-            for ln in lines:
-                m = pattern_str.match(ln)
-                if m:
-                    return m.group(1)
-                m = pattern_list.match(ln)
-                if m:
-                    # Parse comma-separated quoted values
-                    return [s.strip().strip('"') for s in m.group(1).split(',') if s.strip()]
-            return default
+    def parse_dhcp_option(name: str, default=None):
+        # Handles both string and list values
+        pattern_str = re.compile(rf"^\s*{re.escape(name)}\s*=\s*\"([^\"]*)\"\s*$")
+        pattern_list = re.compile(rf"^\s*{re.escape(name)}\s*=\s*\[(.*)\]\s*$")
+        for ln in lines:
+            m = pattern_str.match(ln)
+            if m:
+                return m.group(1)
+            m = pattern_list.match(ln)
+            if m:
+                # Parse comma-separated quoted values
+                return [s.strip().strip('"') for s in m.group(1).split(',') if s.strip()]
+        return default
     if not os.path.isfile(tfvars_path):
         raise FileNotFoundError(tfvars_path)
 

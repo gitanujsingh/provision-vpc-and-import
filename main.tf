@@ -345,7 +345,7 @@ resource "aws_route" "nonroutable_extra" {
           {
             # Use stable key format: just route table CIDR + destination CIDR + target type
             # This key doesn't change between applies, whether using "local" or actual IDs
-            key            = "${rt_key}-${r.destination_cidr_block}-${r.target_type}"
+            key            = "${rt_key}-${r.destination_cidr_block}-${r.target_type}-${r_key}"
             route_table_id = rt.route_table_id
             route          = r
             # Resolve "local" to the NAT gateway for this route table's subnet CIDR

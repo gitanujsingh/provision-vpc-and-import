@@ -263,13 +263,30 @@ def _extract_vpc_endpoint_sgs(discovery: dict) -> list:
 
 
 def _extract_tfvars_values(discovery: dict, import_folder: str) -> dict:
-		# DHCP Options
-		dhcp_options = discovery.get("dhcp_options") or {}
-		domain_name = dhcp_options.get("domain_name", "ec2.internal")
-		domain_name_servers = dhcp_options.get("domain_name_servers", ["AmazonProvidedDNS"])
-		ntp_servers = dhcp_options.get("ntp_servers", ["0.0.0.0"])
-		netbios_name_servers = dhcp_options.get("netbios_name_servers", ["192.168.1.1"])
-		netbios_node_type = dhcp_options.get("netbios_node_type", 2)
+# DHCP Options
+	dhcp_options = discovery.get("dhcp_options") or {}
+	dhcp_configurations = dhcp_options.get("options", {}).get("DhcpConfigurations", [])
+	domain_name = "ec2.internal"
+	domain_name_servers = ["AmazonProvidedDNS"]
+	ntp_servers = ["0.0.0.0"]
+	netbios_name_servers = ["192.168.1.1"]
+	netbios_node_type = 2
+	for conf in dhcp_configurations:
+		key = conf.get("Key", "").lower()
+		values = [v.get("Value") for v in conf.get("Values", []) if v.get("Value")]
+		if key == "domain-name" and values:
+			domain_name = values[0]
+		elif key == "domain-name-servers" and values:
+			domain_name_servers = values
+		elif key == "ntp-servers" and values:
+			ntp_servers = values
+		elif key == "netbios-name-servers" and values:
+			netbios_name_servers = values
+		elif key == "netbios-node-type" and values:
+			try:
+				netbios_node_type = int(values[0])
+			except Exception:
+				pass
 	vpc = discovery.get("vpc") or {}
 	tags = vpc.get("tags") or []
 
@@ -362,12 +379,27 @@ def _to_rule_obj(entry: dict) -> dict:
 def _extract_nacl_rules(discovery: dict, vpc_name: str) -> dict:
 	# Build nacl_rules from discovery so import can bring rules into state and avoid duplicate rule_number errors.
 	nacls = discovery.get("network_acls") or []
+	# Match actual NACL names in JSON
 	public_nacl_name = f"ntw-{vpc_name}-public-nacl"
+	private_nacl_name = f"ntw-{vpc_name}-private-nacl"
 	prn_nacl_name = f"ntw-{vpc_name}-private-nonroutable-nacl"
 	public_nacl = _find_by_tag_name(nacls, public_nacl_name)
+	private_nacl = _find_by_tag_name(nacls, private_nacl_name)
 	prn_nacl = _find_by_tag_name(nacls, prn_nacl_name)
 	public_id = (public_nacl or {}).get("id")
-	prn_id = (prn_nacl or {}).get("id")
+	prn_id = (private_nacl or prn_nacl or {}).get("id")
+
+	# Fallback: If not found by name, match by subnet association
+	if not public_id or not prn_id:
+		subnets = discovery.get("subnets", [])
+		public_subnet_ids = [s["id"] for s in subnets if (s.get("tier") or "").lower() == "public"]
+		private_subnet_ids = [s["id"] for s in subnets if (s.get("tier") or "").lower() == "private"]
+		for nacl in nacls:
+			assoc_subnet_ids = [a.get("SubnetId") for a in nacl.get("associations", [])]
+			if not public_id and any(sid in public_subnet_ids for sid in assoc_subnet_ids):
+				public_id = nacl.get("id")
+			if not prn_id and any(sid in private_subnet_ids for sid in assoc_subnet_ids):
+				prn_id = nacl.get("id")
 
 	rules = discovery.get("network_acl_rules") or []
 
@@ -527,26 +559,20 @@ def _validate_tfvars_coverage(data: dict, vpc_endpoint_sg_ids: set) -> dict:
 
 
 def _write_tfvars(discovery_path: str, out_path: str) -> dict:
-		# DHCP Options
-		f.write("\n# DHCP Options\n")
-		f.write(f"domain_name          = \"{values['domain_name']}\"\n")
-		f.write(f"domain_name_servers  = {json.dumps(values['domain_name_servers'])}\n")
-		f.write(f"ntp_servers          = {json.dumps(values['ntp_servers'])}\n")
-		f.write(f"netbios_name_servers = {json.dumps(values['netbios_name_servers'])}\n")
-		f.write(f"netbios_node_type    = {values['netbios_node_type']}\n")
+# DHCP Options
 	with open(discovery_path, "r") as f:
 		data = json.load(f)
 
 	out_dir = os.path.dirname(out_path)
 	values = _extract_tfvars_values(data, out_dir)
 	nacl_rules = _extract_nacl_rules(data, values["vpc_name"])
-	
+    
 	# Extract VPC endpoint SG IDs first
 	vpc_endpoint_sg_ids = _extract_vpc_endpoint_sgs(data)
-	
+    
 	# Validate coverage
 	validation = _validate_tfvars_coverage(data, vpc_endpoint_sg_ids)
-	
+    
 	with open(out_path, "w", newline="\n") as f:
 		f.write("base_tag = {\n")
 		f.write(f"  Region      = \"{values['region']}\"\n")
@@ -558,6 +584,13 @@ def _write_tfvars(discovery_path: str, out_path: str) -> dict:
 		f.write(f"environment = \"{values['env']}\"\n")
 		f.write(f"region      = \"{values['region']}\"\n\n")
 		f.write(f"vpc_cidr = \"{values['vpc_cidr']}\"\n\n")
+		# DHCP Options
+		f.write("\n# DHCP Options\n")
+		f.write(f"domain_name          = \"{values['domain_name']}\"\n")
+		f.write(f"domain_name_servers  = {json.dumps(values['domain_name_servers'])}\n")
+		f.write(f"ntp_servers          = {json.dumps(values['ntp_servers'])}\n")
+		f.write(f"netbios_name_servers = {json.dumps(values['netbios_name_servers'])}\n")
+		f.write(f"netbios_node_type    = {values['netbios_node_type']}\n")
 
 		f.write("additional_cidrs = [\n")
 		for c in values["additional_cidrs"]:
@@ -647,15 +680,15 @@ def _write_tfvars(discovery_path: str, out_path: str) -> dict:
 			f.write(f"  {key} = [\n")
 			for r in nacl_rules.get(key) or []:
 				f.write("    {\n")
-				f.write(f"      rule_number = {r['rule_number']}\n")
-				f.write(f"      protocol    = \"{r['protocol']}\"\n")
-				f.write(f"      rule_action = \"{r['rule_action']}\"\n")
-				if "cidr_block" in r:
+				f.write(f"      rule_number = {r.get('rule_number', 0)}\n")
+				f.write(f"      protocol    = \"{r.get('protocol', '-1')}\"\n")
+				f.write(f"      rule_action = \"{r.get('rule_action', 'allow')}\"\n")
+				if r.get("cidr_block"):
 					f.write(f"      cidr_block  = \"{r['cidr_block']}\"\n")
-				if "ipv6_cidr_block" in r:
+				if r.get("ipv6_cidr_block"):
 					f.write(f"      ipv6_cidr_block = \"{r['ipv6_cidr_block']}\"\n")
-				f.write(f"      from_port   = {r['from_port']}\n")
-				f.write(f"      to_port     = {r['to_port']}\n")
+				f.write(f"      from_port   = {r.get('from_port', 0)}\n")
+				f.write(f"      to_port     = {r.get('to_port', 0)}\n")
 				f.write("    },\n")
 			f.write("  ]\n")
 		f.write("}\n")
