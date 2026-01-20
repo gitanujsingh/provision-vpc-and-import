@@ -93,7 +93,6 @@ def _parse_selection(selection: str, all_vpcs):
 
 
 def main() -> int:
-    import subprocess
     parser = argparse.ArgumentParser(
         description="Discover VPC resources and write JSON under env/<env>/<vpc-name>-import/",
     )
@@ -270,9 +269,16 @@ def main() -> int:
                 'associations': nacl.get('Associations', [])
             }
             nacl_list.append(nacl_entry)
+            # Extract NACL name from tags
+            nacl_name = None
+            for tag in nacl.get('Tags', []):
+                if tag.get('Key') == 'Name' and tag.get('Value'):
+                    nacl_name = tag.get('Value')
+                    break
             for entry in nacl.get('Entries', []):
                 rule = entry.copy()
                 rule['network_acl_id'] = nacl['NetworkAclId']
+                rule['network_acl_name'] = nacl_name
                 nacl_rules.append(rule)
         resources['network_acls'] = nacl_list
         resources['network_acl_rules'] = nacl_rules
@@ -298,9 +304,16 @@ def main() -> int:
         # Individual Routes (for aws_route)
         routes = []
         for r in rts:
+            # Extract route table name from tags
+            rt_name = None
+            for tag in r.get('Tags', []):
+                if tag.get('Key') == 'Name' and tag.get('Value'):
+                    rt_name = tag.get('Value')
+                    break
             for route in r.get('Routes', []):
                 route_entry = route.copy()
                 route_entry['route_table_id'] = r['RouteTableId']
+                route_entry['route_table_name'] = rt_name
                 routes.append(route_entry)
         resources['routes'] = routes
 
@@ -406,24 +419,6 @@ def main() -> int:
         # Print resource summary
         _print_resource_summary(resources)
 
-    # After discovery, call ram.py for each discovered VPC
-    try:
-        vpc_id = vpc.get('id') or vpc.get('VpcId')
-        vpc_name = _tag_value(vpc.get('tags', []), 'Name') or vpc_id
-        vpc_env = _tag_value(vpc.get('tags', []), 'Environment') or 'unknown'
-        vpc_env_sanitized = vpc_env.replace('::', '--').replace(' ', '-').lower()
-        # Call ram.py with account id, region, vpc id, vpc name, vpc env
-        subprocess.run([
-            sys.executable, 'ram.py',
-            '--account-id', str(account_id),
-            '--region', str(region),
-            '--vpc-id', str(vpc_id),
-            '--vpc-name', str(vpc_name),
-            '--vpc-env', str(vpc_env_sanitized)
-        ], check=True)
-        print(f"Called ram.py for VPC {vpc_id}")
-    except Exception as e:
-        print(f"[WARN] Could not call ram.py: {e}")
     return 0
 
 
