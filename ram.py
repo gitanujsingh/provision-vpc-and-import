@@ -83,29 +83,44 @@ def run_discovery(ec2, ram, vpc_info, region, acc_id):
         print(f" Error during RAM discovery: {e}")
 
 def main():
+    import argparse
     print("--- AWS RAM Detailed Discovery ---")
-    acc = input(" AWS Account ID: ").strip()
-    reg = input(" AWS Region [us-east-1]: ").strip() or "us-east-1"
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--account-id', default=None, help='AWS Account ID')
+    parser.add_argument('--region', default=None, help='AWS Region')
+    parser.add_argument('--vpc-id', default=None, help='VPC ID')
+    parser.add_argument('--vpc-name', default=None, help='VPC Name')
+    parser.add_argument('--vpc-env', default=None, help='VPC Environment')
+    args = parser.parse_args()
+
+    acc = args.account_id or input(" AWS Account ID: ").strip()
+    reg = args.region or input(" AWS Region [us-east-1]: ").strip() or "us-east-1"
+
     sess = boto3.Session(region_name=reg)
     ec2, ram = sess.client("ec2"), sess.client("ram")
 
-    vpcs = []
-    print(f"\nListing VPCs in {reg}...")
-    all_vpcs = ec2.describe_vpcs()['Vpcs']
-    for i, v in enumerate(all_vpcs):
-        name = get_tag(v, ['Name']) or "unnamed"
-        env_raw = get_tag(v, ['Environment', 'Env', 'env']) or "unknown"
-        vpcs.append({'id': v['VpcId'], 'name': name, 'env': sanitize_env(env_raw)})
-        print(f"{i} | {v['VpcId']} | {env_raw} | {name}")
+    if args.vpc_id and args.vpc_name and args.vpc_env:
+        # Called non-interactively with all details
+        vpc_info = {'id': args.vpc_id, 'name': args.vpc_name, 'env': args.vpc_env}
+        run_discovery(ec2, ram, vpc_info, reg, acc)
+    else:
+        # Interactive mode
+        vpcs = []
+        print(f"\nListing VPCs in {reg}...")
+        all_vpcs = ec2.describe_vpcs()['Vpcs']
+        for i, v in enumerate(all_vpcs):
+            name = get_tag(v, ['Name']) or "unnamed"
+            env_raw = get_tag(v, ['Environment', 'Env', 'env']) or "unknown"
+            vpcs.append({'id': v['VpcId'], 'name': name, 'env': sanitize_env(env_raw)})
+            print(f"{i} | {v['VpcId']} | {env_raw} | {name}")
 
-    sel = input("\n Enter Index (or Enter for ALL): ").strip()
-    try:
-        targets = vpcs if sel == "" else [vpcs[int(sel)]]
-        for t in targets:
-            run_discovery(ec2, ram, t, reg, acc)
-    except (ValueError, IndexError):
-        print(" Invalid selection.")
+        sel = input("\n Enter Index (or Enter for ALL): ").strip()
+        try:
+            targets = vpcs if sel == "" else [vpcs[int(sel)]]
+            for t in targets:
+                run_discovery(ec2, ram, t, reg, acc)
+        except (ValueError, IndexError):
+            print(" Invalid selection.")
 
 if __name__ == "__main__":
     main()
