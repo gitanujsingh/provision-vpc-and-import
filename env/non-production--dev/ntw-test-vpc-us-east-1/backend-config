@@ -1,6 +1,0 @@
-# Local backend for testing - change to S3 for production
-# Uncomment and configure for S3 backend:
- bucket         = "tmo-aws-tf-state-bucket"
- #key            = "vpcs/non-production/dev/ntw-test-vpc-us-east-1/terraform.tfstate"
- key            = "envs/Non-production--Dev/ntw-test-vpc-us-east1/terraform.tfstate"
- region         = "us-east-1"
