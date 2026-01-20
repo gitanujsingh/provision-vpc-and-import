@@ -889,7 +889,7 @@ def _write_tfvars(discovery_path: str, out_path: str) -> dict:
 				f.write(f"  \"{key}\" = {{\n")
 				f.write(f"    name        = \"{sg['name']}\"\n")
 				f.write(f"    description = \"{sg['description']}\"\n")
-				
+
 				# Ingress rules
 				f.write("    ingress_rules = [\n")
 				for rule in sg.get('ingress_rules', []):
@@ -1056,6 +1056,10 @@ def main() -> int:
 				vpc_name = _tag_value(vpc_tags, "Name") or (jdata.get("vpc") or {}).get("id", "?")
 			except Exception:
 				vpc_name = "?"
+
+		# --- RAM resource logic: read ram_resource.json and filter vpc_match=true ---
+		# This block should be inside the for discovery_path in selected_files loop
+		# so move it below, not here
 			print(f"  {idx}. {jf} (VPC: {vpc_name})")
 
 		sel = input(f"Select file(s) [1-{len(json_files)}] (comma-separated, press Enter for latest only): ").strip()
@@ -1071,9 +1075,48 @@ def main() -> int:
 		return 1
 
 	for discovery_path in selected_files:
+		# Write main tfvars content
 		out_tfvars = os.path.join(os.path.dirname(discovery_path), "terraform.tfvars")
 		values = _write_tfvars(discovery_path, out_tfvars)
 		print(f"Wrote: {out_tfvars}")
+
+		# --- RAM resource logic: read ram_resource.json and filter vpc_match=true ---
+		import_folder = os.path.dirname(discovery_path)
+		ram_json_path = os.path.join(import_folder, "ram_resource.json")
+		ram_resource_shares = []
+		if os.path.isfile(ram_json_path):
+			try:
+				with open(ram_json_path) as ramf:
+					ram_data = json.load(ramf)
+				for share in ram_data.get("shares", []):
+					filtered_resources = [r for r in share.get("resources", []) if r.get("vpc_match") is True]
+					if filtered_resources:
+						ram_resource_shares.append({
+						"name": share.get("name", ""),
+						"arn": share.get("arn", ""),
+						"resources": filtered_resources
+					})
+			except Exception as e:
+				print(f"[WARN] Failed to read RAM resources: {e}", file=sys.stderr)
+
+		# Append RAM resource shares to tfvars if present
+		if ram_resource_shares:
+			with open(out_tfvars, "a", newline="\n") as f:
+				f.write("\n# AWS RAM Resource Shares\n")
+				f.write("ram_resource_shares = [\n")
+				for share in ram_resource_shares:
+					f.write("  {\n")
+					f.write(f"    name = \"{share.get('name', '')}\"\n")
+					f.write(f"    arn  = \"{share.get('arn', '')}\"\n")
+					if share.get('resources'):
+						f.write("    resources = [\n")
+						for res in share['resources']:
+							f.write(f"      {{ type = \"{res.get('type', '')}\", arn = \"{res.get('arn', '')}\", vpc_match = {str(res.get('vpc_match', False)).lower()} }},\n")
+						f.write("    ]\n")
+					else:
+						f.write("    resources = []\n")
+					f.write("  },\n")
+				f.write("]\n")
 
 		out_dir = os.path.dirname(discovery_path)
 		backend_path = _write_backend_config(

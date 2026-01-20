@@ -10,14 +10,11 @@ def get_tag(res, keys):
     return None
 
 def sanitize_env(name):
-    # Matches your specific requirement: Non-production::Dev -> non-production--dev
     s = name.replace('::', '--')
     return re.sub(r'[^a-zA-Z0-9\-_]', '-', s).lower()
 
 def run_discovery(ec2, ram, vpc_info, region, acc_id):
     vid, vname, venv = vpc_info['id'], vpc_info['name'], vpc_info['env']
-    
-    # Path: env/non-production--dev/ntw-npe-vpc-us-east-1-import/
     f_path = Path("env") / venv / f"{vname}-import"
     f_path.mkdir(parents=True, exist_ok=True)
 
@@ -26,34 +23,69 @@ def run_discovery(ec2, ram, vpc_info, region, acc_id):
         "shares": []
     }
 
+    print(f"\n[DEBUG] Analyzing RAM Shares for VPC: {vid}")
+
     try:
-        for page in ram.get_paginator("get_resource_shares").paginate(resourceOwner='SELF'):
+        # 1. Get all resource shares owned by this account
+        pager = ram.get_paginator("get_resource_shares")
+        for page in pager.paginate(resourceOwner='SELF'):
             for sh in page.get("resourceShares", []):
-                s_data = {"name": sh['name'], "arn": sh['resourceShareArn'], "resources": []}
-                for r_page in ram.get_paginator("list_resources").paginate(resourceOwner='SELF', resourceShareArns=[sh['resourceShareArn']]):
+                s_arn = sh['resourceShareArn']
+                s_data = {
+                    "name": sh['name'],
+                    "arn": s_arn,
+                    "status": sh.get('status'),
+                    "allowExternalPrincipals": sh.get('allowExternalPrincipals'),
+                    "resources": [],
+                    "principals": []
+                }
+
+                # 2. Get the actual resources in this share
+                res_pager = ram.get_paginator("list_resources")
+                for r_page in res_pager.paginate(resourceOwner='SELF', resourceShareArns=[s_arn]):
                     for r in r_page.get("resources", []):
-                        rt = r.get("resourceType", "")
-                        if not rt: continue
+                        r_arn = r['arn']
+                        r_type = r['type']
                         match = False
-                        if "subnet" in rt.lower():
+
+                        # Check if resource is a subnet belonging to our target VPC
+                        if "subnet" in r_type.lower():
                             try:
-                                v_chk = ec2.describe_subnets(SubnetIds=[r['arn'].split('/')[-1]])['Subnets'][0]['VpcId']
+                                sub_id = r_arn.split('/')[-1]
+                                v_chk = ec2.describe_subnets(SubnetIds=[sub_id])['Subnets'][0]['VpcId']
                                 if v_chk == vid: match = True
                             except: pass
-                        s_data["resources"].append({"type": rt, "arn": r['arn'], "vpc_match": match})
-                out["shares"].append(s_data)
+                        
+                        s_data["resources"].append({
+                            "arn": r_arn,
+                            "type": r_type,
+                            "vpc_match": match,
+                            "last_updated": r.get('lastUpdatedTime').isoformat() if r.get('lastUpdatedTime') else None
+                        })
+
+                # 3. Get the principals (Accounts/OUs) this is shared with
+                p_pager = ram.get_paginator("list_principals")
+                for p_page in p_pager.paginate(resourceOwner='SELF', resourceShareArns=[s_arn]):
+                    for p in p_page.get("principals", []):
+                        s_data["principals"].append(p['id'])
+
+                # Only add the share if it contains resources matching our VPC 
+                # OR if it's a TGW share which is often relevant to the network stack
+                if any(res['vpc_match'] for res in s_data['resources']) or "tgw" in sh['name'].lower():
+                    out["shares"].append(s_data)
 
         final_file = f_path / "ram_resource.json"
         with open(final_file, "w") as f:
             json.dump(out, f, indent=4)
-        print(f" Saved to: {final_file.as_posix()}")
+        print(f" Full details saved to: {final_file.as_posix()}")
+
     except Exception as e:
-        print(f" Error: {e}")
+        print(f" Error during RAM discovery: {e}")
 
 def main():
-    print("--- AWS RAM Tool ---")
-    acc = input("AWS Account ID: ").strip()
-    reg = input(" AWSRegion [us-east-1]: ").strip() or "us-east-1"
+    print("--- AWS RAM Detailed Discovery ---")
+    acc = input(" AWS Account ID: ").strip()
+    reg = input(" AWS Region [us-east-1]: ").strip() or "us-east-1"
     
     sess = boto3.Session(region_name=reg)
     ec2, ram = sess.client("ec2"), sess.client("ram")
@@ -68,10 +100,12 @@ def main():
         print(f"{i} | {v['VpcId']} | {env_raw} | {name}")
 
     sel = input("\n Enter Index (or Enter for ALL): ").strip()
-    targets = vpcs if sel == "" else [vpcs[int(sel)]]
-    
-    for t in targets:
-        run_discovery(ec2, ram, t, reg, acc)
+    try:
+        targets = vpcs if sel == "" else [vpcs[int(sel)]]
+        for t in targets:
+            run_discovery(ec2, ram, t, reg, acc)
+    except (ValueError, IndexError):
+        print(" Invalid selection.")
 
 if __name__ == "__main__":
     main()
